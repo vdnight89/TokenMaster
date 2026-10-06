@@ -1,0 +1,23 @@
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Node
+node_modules/
+dist/
+*.local
+
+# 构建产物
+release/
+
+# IDE / 工具缓存
+.vscode/
+.idea/
+.mimosa/
+*.log
+design/round-01/shots/
+design/round-01/vendor/
+# Rust
+crates/target/
+tsconfig.tsbuildinfo

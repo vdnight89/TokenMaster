@@ -1,0 +1,75 @@
+[
+  {
+    "file": "motion-probe",
+    "state": null,
+    "size": "1280x900",
+    "zoom": 1,
+    "motion": {
+      "load": {
+        "elements": 1,
+        "loops": 0,
+        "maxMove": 6,
+        "maxSize": 0,
+        "maxOpacity": 0.96,
+        "top": [
+          {
+            "el": "section#page-gateway.page.on",
+            "move": 6,
+            "size": 0,
+            "opacity": 0.96,
+            "loop": false,
+            "sources": [
+              "css:pagein"
+            ]
+          }
+        ]
+      },
+      "steps": {
+        "elements": 1,
+        "loops": 0,
+        "maxMove": 8,
+        "maxSize": 0,
+        "maxOpacity": 0.84,
+        "top": [
+          {
+            "el": "div.toast.info",
+            "move": 8,
+            "size": 0,
+            "opacity": 0.84,
+            "loop": false,
+            "sources": [
+              "css:toastin"
+            ]
+          }
+        ]
+      },
+      "hero": {
+        "elements": 0,
+        "loops": 0,
+        "maxMove": 0,
+        "maxSize": 0,
+        "maxOpacity": 0,
+        "top": [],
+        "layers": 0
+      },
+      "scroll": {
+        "elements": 0,
+        "loops": 0,
+        "maxMove": 0,
+        "maxSize": 0,
+        "maxOpacity": 0,
+        "top": []
+      }
+    },
+    "issues": [
+      "滚动：没有检测到随滚动出现的变化；落地页、品牌页、发布页和展览页需要一段滚动叙事"
+    ]
+  },
+  {
+    "file": "page.png",
+    "state": null,
+    "size": "1280x900",
+    "zoom": 1,
+    "issues": []
+  }
+]

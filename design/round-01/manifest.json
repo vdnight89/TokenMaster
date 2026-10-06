@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "project": "TokenMaster",
+  "brief": "Windows 桌面客户端：15 家 AI 编程服务的账号令牌池与本地 OpenAI 协议网关的管理界面。首屏要回答：池子现在健康吗、哪些账号临期或异常、网关是否在正常服务。三个候选共享同一份示例数据（zcode 展开 5 账号、今日 1,247 请求 / 2.31M tokens、5 条待办），交互小样可点击体验。",
+  "round": "01",
+  "candidates": [
+    {
+      "id": "breaker",
+      "name": "配电房",
+      "concept": "像管理一面配电箱：每条回路一眼看清负载，跳闸的回路红灯亮起，推上去就恢复",
+      "typography": "Segoe UI/微软雅黑，铭牌标签全大写字距加宽；一切数字 Cascadia Mono 等宽，底部电表读数用大号",
+      "palette": ["#17191D", "#FFB020", "#38C172"],
+      "traits": ["断路器行 + LED 状态灯 + 纵向拨杆开关，行高 32px 高密度", "顶部分段导航 + 底部电表读数条，无指标卡", "跳闸行展开红色检修面板（试试点击 tm-03 行）"],
+      "kind": "html",
+      "source": "a-breaker.html",
+      "interactive": true
+    },
+    {
+      "id": "ledger",
+      "name": "总机台账",
+      "concept": "像一位老式总机接线员：插孔板上的灯在闪，把每一次请求接到正确的线路上，台账上一笔记一笔",
+      "typography": "SimSun/Georgia 衬线标题，正文宋体 13px；编号与数字 Courier 打字机体，字段用点线引导",
+      "palette": ["#F5F1E8", "#1D1A16", "#B23A2E"],
+      "traits": ["左目录 + 中待办队列 + 右登记卡的三段收件箱", "纸白单色印刷 + 邮戳红印章徽章，双细线无阴影", "亮色印刷感，正面打破 AI 工具黑底紫光套路；试试点击队列切换与签到盖章"],
+      "kind": "html",
+      "source": "b-ledger.html",
+      "interactive": true
+    },
+    {
+      "id": "cage",
+      "name": "筹码室",
+      "concept": "像坐在筹码室柜台后：每一摞筹码是一家 provider 的额度，随手可数，兑付窗口灯火通明",
+      "typography": "Segoe UI 粗体宽字距标题；数字 Cascadia Mono 粗体大号，筹码刻字感",
+      "palette": ["#123527", "#F2ECDB", "#C9A227"],
+      "traits": ["桌位卡片货架 + 筹码摞可视化额度（数字画成看得见的量）", "毛毡深绿 + 黄铜线 + 象牙字，12px 圆角有分量", "中低密度；试试 minimax 桌位的签到收筹"],
+      "kind": "html",
+      "source": "c-cage.html",
+      "interactive": true
+    }
+  ]
+}

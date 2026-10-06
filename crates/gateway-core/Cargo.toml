@@ -1,0 +1,23 @@
+[package]
+name = "gateway-core"
+version.workspace = true
+edition.workspace = true
+description = "TokenMaster 本地 OpenAI 协议网关核心（纯 Rust 库，不依赖 Tauri 运行时，见 ADR-0004）"
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order：commandcode 上游信封对键序敏感（见 docs/reference/commandcode-proxy.md）
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+rand = "0.9"
+async-trait = "0.1"
+futures = "0.3"
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
