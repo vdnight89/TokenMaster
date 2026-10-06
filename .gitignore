@@ -1,0 +1,18 @@
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Node
+node_modules/
+dist/
+*.local
+
+# 构建产物
+release/
+
+# IDE / 工具缓存
+.vscode/
+.idea/
+.mimosa/
+*.log

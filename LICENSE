@@ -1,0 +1,21 @@
+TokenMaster
+
+Copyright (c) 2026 于翔 (vdnight)
+
+本项目按 Creative Commons Attribution-NonCommercial-ShareAlike 4.0
+International（署名-非商业性-相同方式共享 4.0 国际，CC-BY-NC-SA-4.0）提供：
+
+  https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh
+
+完整许可文本：https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode.zh
+
+原因：本项目直接复用了 Antigravity-Manager-main（CC-BY-NC-SA-4.0）的 Rust
+代码（令牌池、OAuth 回调、自适应重试换号等模块），其衍生代码部分须以相同
+许可发布且不得用于商业目的，详见 docs/adr/0002-reuse-antigravity-manager-code.md。
+
+同时复用的 MIT 许可代码来源（各自遵循其原许可的署名要求）：
+- zcode-pool（MIT, Copyright (c) 2026 zcode-pool contributors）
+- deepseek-harness-codearts（MIT, Copyright (c) 2026 Jet）
+- commandcode-proxy（MIT, Copyright (c) 2026 MAXeaglet）
+
+上述来源的许可文本可在对应上游仓库查阅。
