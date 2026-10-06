@@ -2,23 +2,26 @@
 //! 缝 1 的被测边界——测试进程内 `start_with()` 起真实监听。
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, HeaderName};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde_json::json;
 
 use crate::config::{AuthMode, GatewayConfig};
 use crate::error::ApiError;
-use crate::openai::ChatRequest;
-use crate::provider::{Provider, ProviderError};
+use crate::openai::{ChatRequest, Usage};
+use crate::provider::{Provider, ProviderError, StreamChunk};
 use crate::route::resolve_model;
 
 #[derive(Clone)]
@@ -104,8 +107,59 @@ async fn chat_completions(
     let Json(req) = payload.map_err(|_| ApiError::Message("invalid or missing JSON body".into()))?;
     let route = resolve_model(&req.model, &state.config.model_map)?;
     let provider = state.providers.get(&route.provider).ok_or(ApiError::ModelNotFound)?.clone();
-    let completion = provider.complete(&route, &req).await.map_err(provider_error)?;
-    Ok(Json(serde_json::to_value(completion).expect("completion serializes")).into_response())
+    if req.stream {
+        let chunk_stream = provider.stream(&route, &req).await.map_err(provider_error)?;
+        Ok(openai_sse(chunk_stream, route.composite()).into_response())
+    } else {
+        let completion = provider.complete(&route, &req).await.map_err(provider_error)?;
+        Ok(Json(serde_json::to_value(completion).expect("completion serializes")).into_response())
+    }
+}
+
+/// Provider 增量流 → OpenAI `chat.completion.chunk` SSE。
+/// 结尾：finish chunk → 空 choices 的 usage chunk → `[DONE]`。
+fn openai_sse(
+    chunk_stream: crate::provider::ChunkStream,
+    model: String,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let id = format!("chatcmpl-{}", crate::key::random_id(12));
+    let created = crate::openai::now_ts();
+    let (tail_id, tail_model, tail_created) = (id.clone(), model.clone(), created);
+    let base = move |delta: serde_json::Value, finish: Option<&str>| {
+        json!({
+            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }]
+        })
+    };
+    let usage_cell: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
+    let cell = usage_cell.clone();
+    let mapped = chunk_stream.map(move |item| {
+        let ev = match item {
+            Ok(StreamChunk::Role) => base(json!({ "role": "assistant", "content": "" }), None),
+            Ok(StreamChunk::Content(s)) => base(json!({ "content": s }), None),
+            Ok(StreamChunk::Reasoning(s)) => base(json!({ "reasoning_content": s }), None),
+            Ok(StreamChunk::Finish { reason, usage }) => {
+                *cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(usage);
+                base(json!({}), Some(&reason))
+            }
+            Err(e) => base(json!({ "refusal": e.to_string() }), Some("error")),
+        };
+        Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&ev).expect("chunk serializes")))
+    });
+    let tail_cell = usage_cell;
+    let tail = futures::stream::once(async move {
+        let usage = tail_cell.lock().unwrap_or_else(|p| p.into_inner()).unwrap_or_default();
+        let usage_chunk = json!({
+            "id": tail_id, "object": "chat.completion.chunk", "created": tail_created, "model": tail_model,
+            "choices": [], "usage": usage
+        });
+        futures::stream::iter(vec![
+            Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&usage_chunk).expect("usage serializes"))),
+            Ok(Event::default().data("[DONE]")),
+        ])
+    })
+    .flatten();
+    Sse::new(mapped.chain(tail)).keep_alive(KeepAlive::default())
 }
 
 /// Provider 故障映射为对外错误。M2 编排层在此之前完成换号重试；
