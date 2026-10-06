@@ -9,8 +9,8 @@
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
 | T0.1 | Vite + React 19 + TS 前端骨架，原型 CSS/图标/格式化工具迁入，`pnpm build` 通过 | — | done | — |
-| T0.2 | Cargo workspace：`crates/gateway-core`（纯库）+ `src-tauri`（壳）骨架，`cargo test --workspace` 空passes | — | done(壳待T0.3) | rustup |
-| T0.3 | Tauri 2 壳接通：窗口起得来、前端加载、IPC ping/pong | — | todo | T0.1, T0.2 |
+| T0.2 | Cargo workspace：`crates/gateway-core`（纯库）+ `src-tauri`（壳）骨架，`cargo test --workspace` 空passes | — | done | rustup |
+| T0.3 | Tauri 2 壳接通：窗口起得来、前端加载、IPC ping/pong | — | done(冒烟：8787→401/5173→200) | T0.1, T0.2 |
 | T0.4 | 前端 mock 数据层（移植原型 DATA：15 provider/42 账号/用量/日志），供 GUI 先行开发 | — | done(agent) | T0.1 |
 
 ## M1 网关核心 · OpenAI/Anthropic 面（缝 1：HTTP 黑盒）
@@ -50,7 +50,7 @@
 
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
-| T4.1 | zcode：双通道(anthropic)、CLI 设备码登录、伪装头、3007→验证码事件、套餐领取、积分/额度 | 2 | todo | M1, M2 |
+| T4.1 | zcode：双通道(anthropic)、CLI 设备码登录、伪装头、3007→验证码事件、套餐领取、积分/额度 | 2 | doing(T4.1a 非流式done) | M1, M2 |
 | T4.2 | gemini：CloudCode 上游、OAuth 回调、双层信封、thoughtSignature、Antigravity 身份 | 2 | todo | M1, M2 |
 | T4.3 | commandcode：私有信封、每 key 设备指纹(HMAC)、SSE 转译、user_ key 透传 | 2 | todo | M1, M2 |
 | T4.4 | trae：SOLO 载荷/SSE、本地回调 18080、Cloud-IDE-JWT | 2 | todo | M1, M2 |
