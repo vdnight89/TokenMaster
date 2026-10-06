@@ -581,3 +581,10 @@ table.tbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size
 
 /* 展开行 */
 .tr-x { display: none; }
+
+/* ============================================================
+   追加（React 移植补充，不改动上方既有规则）
+   ============================================================ */
+/* rlabel 标题/描述需纵向堆叠（对齐原型 app.css 中被漏拷的声明） */
+.rlabel .rt { display: block; }
+.rlabel .rd { display: block; margin-top: 2px; line-height: 1.5; }

@@ -59,7 +59,7 @@
         <div class="statusbar">
           <div class="sbc"><div class="k">网关服务</div><div class="v" id="kpi-gw"><span class="okc">运行中</span></div><div class="f" id="kpi-gw-f">127.0.0.1:8787 · 双协议面</div></div>
           <div class="sbc"><div class="k">今日请求</div><div class="v">1,247</div><div class="f"><span class="badc">失败 18</span> · 限流冷却 67 次</div></div>
-          <div class="sbc"><div class="k">今日 Tokens</div><div class="v">2.31<small>M</small></div><div class="f">输入 1.62M · 输出 512K</div></div>
+          <div class="sbc"><div class="k">今日 Tokens</div><div class="v">2.13<small>M</small></div><div class="f" title="另有缓存命中 178K">输入 1.62M · 输出 512K</div></div>
           <div class="sbc"><div class="k">号池吞吐</div><div class="v" id="kpi-thru">—</div><div class="f" id="kpi-thru-f">—</div></div>
           <div class="sbc"><div class="k">平均响应</div><div class="v">6.2<small>s</small></div><div class="f">整发时长 · 首字节 412ms</div></div>
           <div class="sbc"><div class="k">池健康</div><div class="v">37<small>/ 42</small></div><div class="f">1 限流 · 2 临期 · 1 失效 · 1 停用</div></div>
@@ -110,10 +110,21 @@
           <div class="card-h">
             <span class="chipic c-err" id="ic-err"></span>
             <span class="ttl">请求结果分布</span>
-            <span class="more">今日成功率 <b class="mono" id="err-rate" style="color:var(--ok)">98.4%</b></span>
+            <span class="more">换号后最终成功率 <b class="mono" id="err-rate" style="color:var(--ok)">98.6%</b></span>
           </div>
           <div style="display:flex;height:10px;border-radius:5px;overflow:hidden;gap:2px;margin-bottom:6px" id="err-bar"></div>
           <div id="err-list"></div>
+          <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
+            <div class="up" style="margin-bottom:6px">换号后最终结果 · 今日</div>
+            <div style="display:flex;height:10px;border-radius:5px;overflow:hidden;gap:2px">
+              <i style="flex:1229;background:#10b981" title="成功 1,229"></i>
+              <i style="flex:18;background:#f43f5e" title="最终失败 18"></i>
+            </div>
+            <div style="display:flex;font-size:11px;color:var(--t4);margin-top:5px;font-family:var(--mono)">
+              <span>成功 1,229</span><span class="grow"></span><span style="color:var(--err)">失败 18 · 1.4%</span>
+            </div>
+            <div class="mnote" style="margin-top:8px">67 次 429 · 21 次 401 · 9 次 402 为换号前首试结果，绝大多数经自动换号恢复，仅 18 次最终失败。</div>
+          </div>
         </div>
       </div>
 
@@ -276,12 +287,12 @@
       </div>
 
       <div class="gstat-grid">
-        <div class="gstat g-blue"><div class="lab">总请求</div><div class="num" id="g-req">8,634</div><div class="delta" style="color:#34d399">▲ 12.4% vs 上期</div></div>
-        <div class="gstat g-violet"><div class="lab">输入 Tokens</div><div class="num" id="g-in">11.2M</div><div class="delta" style="color:#34d399">▲ 9.1%</div></div>
-        <div class="gstat g-cyan"><div class="lab">输出 Tokens</div><div class="num" id="g-out">3.6M</div><div class="delta" style="color:#34d399">▲ 14.8%</div></div>
-        <div class="gstat g-ok"><div class="lab">缓存命中</div><div class="num" id="g-ch">1.24M</div><div class="delta" style="color:var(--t4)">占输入 15.4%</div></div>
-        <div class="gstat g-warn"><div class="lab">平均 TTFB</div><div class="num" id="g-ttfb">412ms</div><div class="delta" style="color:#34d399">▼ 36ms</div></div>
-        <div class="gstat g-rose"><div class="lab">成功率</div><div class="num" id="g-rate">98.2%</div><div class="delta" style="color:var(--t4)">失败 71 次</div></div>
+        <div class="gstat g-blue"><div class="lab">总请求</div><div class="num" id="g-req">7,191</div><div class="delta" style="color:#34d399">▲ 12.4% vs 上期</div></div>
+        <div class="gstat g-violet"><div class="lab">输入 Tokens</div><div class="num" id="g-in">8.90M</div><div class="delta" style="color:#34d399">▲ 9.1%</div></div>
+        <div class="gstat g-cyan"><div class="lab">输出 Tokens</div><div class="num" id="g-out">2.84M</div><div class="delta" style="color:#34d399">▲ 14.8%</div></div>
+        <div class="gstat g-ok"><div class="lab">缓存命中</div><div class="num" id="g-ch">0.89M</div><div class="delta" style="color:var(--t4)" id="g-chp">占输入 10.0%</div></div>
+        <div class="gstat g-warn"><div class="lab">平均 TTFB</div><div class="num" id="g-ttfb">434ms</div><div class="delta" style="color:#34d399">▼ 36ms</div></div>
+        <div class="gstat g-rose"><div class="lab">成功率</div><div class="num" id="g-rate">99.0%</div><div class="delta" style="color:var(--t4)" id="g-fail">失败 71 次</div></div>
       </div>
 
       <div class="card" style="margin-top:12px">
@@ -321,7 +332,7 @@
           <div class="card-h">
             <span class="chipic c-cyan" id="ic-top"></span>
             <span class="ttl">账号消耗 Top 6</span>
-            <span class="more">万 tokens</span>
+            <span class="more">单位：K tokens</span>
           </div>
           <div id="u-top"></div>
         </div>

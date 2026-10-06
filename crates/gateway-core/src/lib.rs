@@ -5,4 +5,9 @@
 pub mod config;
 pub mod error;
 pub mod key;
+pub mod mock;
+pub mod openai;
+pub mod provider;
+pub mod registry;
+pub mod route;
 pub mod server;

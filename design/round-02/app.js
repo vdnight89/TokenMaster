@@ -328,7 +328,10 @@ function chartTrend(el, data, opt) {
   }
   const step = Math.ceil(n / (W < 500 ? 6 : 12));
   data.hours.forEach((hh, i) => {
-    if (i % step === 0 || i === n - 1) s += `<text x="${x(i)}" y="${H - 7}" text-anchor="middle" font-size="9" fill="#64748b" font-family="var(--mono)">${hh}</text>`;
+    if (i % step !== 0) return;
+    const xx = x(i);
+    if (xx > W - padR - 30) return; // 防止末尾标签越界或与前一标签重叠
+    s += `<text x="${xx}" y="${H - 7}" text-anchor="middle" font-size="9" fill="#64748b" font-family="var(--mono)">${hh}</text>`;
   });
   let acc = new Array(n).fill(0);
   keys.forEach((k, ki) => {
@@ -394,8 +397,8 @@ function chartDonut(el, data, opt) {
     s += `<circle cx="${R}" cy="${R}" r="${r1}" fill="none" stroke="${c}" stroke-width="16" stroke-dasharray="${len - 2.5} ${C - len + 2.5}" stroke-dashoffset="${-off}" transform="rotate(-90 ${R} ${R})" stroke-linecap="round"><title>${esc(d.k)} ${d.v}%</title></circle>`;
     off += len;
   });
-  s += `<text x="${R}" y="${R - 3}" text-anchor="middle" font-size="19" font-weight="700" fill="var(--t1)" font-family="var(--mono)">8,634</text>`;
-  s += `<text x="${R}" y="${R + 14}" text-anchor="middle" font-size="9.5" fill="#64748b" font-family="var(--mono)">REQUESTS · 7D</text></svg>`;
+  s += `<text x="${R}" y="${R - 3}" text-anchor="middle" font-size="19" font-weight="700" fill="var(--t1)" font-family="var(--mono)">${opt.center || "8,634"}</text>`;
+  s += `<text x="${R}" y="${R + 14}" text-anchor="middle" font-size="9.5" fill="#64748b" font-family="var(--mono)">${opt.centerSub || "REQUESTS · 7D"}</text></svg>`;
   el.innerHTML = s;
 }
 
@@ -404,7 +407,7 @@ function chartHbars(el, data) {
   const max = Math.max(...data.map(d => d.v));
   el.innerHTML = `<div class="hbars">` + data.map((d) => {
     const c = PROVIDERS[d.pv].color;
-    return `<div class="hbar"><div class="nm"><i style="background:${c}"></i>${esc(d.n)}</div>
+    return `<div class="hbar"><div class="nm" title="${esc(d.n)}"><i style="background:${c}"></i><span>${esc(d.n)}</span></div>
       <div class="track"><b style="width:${(d.v / max * 100).toFixed(1)}%;background:linear-gradient(90deg,${c}88,${c})"></b></div>
       <div class="val">${fmtK(d.v)}k</div></div>`;
   }).join("") + `</div>`;
@@ -466,7 +469,7 @@ function gaugeSVG(pct, opt) {
   return s;
 }
 function renderGauges(el) {
-  const pools = [["zcode", 72, "2.9M / 4M"], ["gemini", 84, "84% 周窗"], ["trae", 61, "3,050 / 5,000"], ["qoder", 45, "9,000 / 20,000"], ["minimax", 39, "7,800 / 20,000"]];
+  const pools = [["zcode", 72, "余 2.9M / 共 4M"], ["gemini", 84, "余 8.4M / 共 10M"], ["trae", 61, "余 3,050 / 共 5,000"], ["qoder", 45, "余 9,000 / 共 20,000"], ["minimax", 39, "余 7,800 / 共 20,000"]];
   el.innerHTML = `<div class="gauges">` + pools.map(([k, p, sub]) =>
     `<div class="mg">${gaugeSVG(p, {})}<div class="gn" style="color:${PROVIDERS[k].color}">${PROVIDERS[k].name}</div><div class="gs">${sub}</div></div>`
   ).join("") + `<div class="mg" style="justify-content:center"><div class="up" style="margin-bottom:8px">池合计</div>
@@ -523,16 +526,19 @@ function renderTopo(el) {
   s += box(14, 112, 150, 34, "var(--line-2)", "var(--card)", "Codex CLI / SDK", null);
   s += line(89, 62, 230, 118, "#64748b"); s += line(89, 87, 230, 130, "#64748b"); s += line(89, 112, 230, 142, "#64748b");
   s += box(230, 96, 200, 68, "#3b82f6", "url(#tp-g)", "TokenMaster 网关", "127.0.0.1:8787 · OpenAI / Anthropic");
-  s += `<text x="240" y="184" font-size="9" fill="#64748b" font-family="var(--mono)">路由 · 池化轮询 · 换号重试 · 账本 · 限流冷却</text>`;
+  s += `<text x="232" y="184" font-size="9" fill="#64748b" font-family="var(--mono)">路由 · 池化 · 换号</text>`;
+  // Provider 池区底板：连线只接到板缘，不在板内穿字
+  s += `<text x="14" y="200" font-size="9.5" fill="#64748b" font-family="var(--mono)" letter-spacing="1">TOKEN POOLS × 15</text>`;
+  s += `<rect x="340" y="212" width="216" height="98" rx="10" fill="var(--card)" stroke="var(--line)" stroke-width="1.2"/>`;
+  s += line(352, 164, 412, 212, "#64748b"); s += line(400, 164, 488, 212, "#64748b");
   const pvShow = ["zcode", "gemini", "trae", "qoder", "minimax", "codearts"];
-  s += `<text x="360" y="218" font-size="9.5" fill="#64748b" font-family="var(--mono)" letter-spacing="1">TOKEN POOLS × 15</text>`;
-  s += line(330, 164, 402, 236, "#64748b"); s += line(330, 164, 466, 236, "#64748b");
   pvShow.forEach((k, i) => {
-    const x = 356 + (i % 3) * 66, y = 228 + Math.floor(i / 3) * 38;
-    s += box(x, y, 60, 30, PROVIDERS[k].color + "88", PROVIDERS[k].color + "1f", PROVIDERS[k].name, null);
-    s += line(330, 164, x + 30, y, "#3f4a5f", true);
+    const x = 352 + (i % 3) * 70, y = 226 + Math.floor(i / 3) * 36;
+    s += box(x, y, 62, 28, PROVIDERS[k].color + "88", PROVIDERS[k].color + "1f", PROVIDERS[k].name, null);
   });
-  s += `<text x="356" y="312" font-size="9.5" fill="#64748b" font-family="var(--mono)">+9 more · 每池独立选号策略与临期分档</text></svg>`;
+  s += `<text x="14" y="226" font-size="9.5" fill="#64748b" font-family="var(--mono)">6 / 15 shown</text>`;
+  s += `<text x="14" y="244" font-size="9.5" fill="#64748b" font-family="var(--mono)">每池独立选号</text>`;
+  s += `<text x="14" y="262" font-size="9.5" fill="#64748b" font-family="var(--mono)">策略与临期分档</text></svg>`;
   el.innerHTML = s;
 }
 
@@ -547,7 +553,7 @@ function renderDash() {
     return `<div class="todo" data-id="${t.id}">
       <div class="pv" style="background:${pv.color}">${pv.name[0]}</div>
       <div class="tx grow"><div class="tt">${t.t}</div><div class="td">${t.d}</div></div>
-      <button class="btn sm ${t.act === "领取" ? "p" : ""}" data-todo="${i}">${t.act}</button>
+      <button class="btn sm js-ci ${t.act === "领取" ? "p" : ""}" data-todo="${i}">${t.act}</button>
     </div>`;
   }).join("");
   $$("#todo-list [data-todo]").forEach(btn => {
@@ -624,7 +630,7 @@ function renderAccounts() {
   const counts = { all: ACCOUNTS.length };
   ["ok", "cool", "exp", "dead", "off"].forEach(s => counts[s] = ACCOUNTS.filter(a => a.state === s).length);
   const segBox = $("#acc-filters");
-  segBox.innerHTML = [["all", "全部"], ["ok", "可用"], ["cool", "限流"], ["exp", "临期"], ["dead", "异常"], ["off", "停用"]]
+  segBox.innerHTML = [["all", "全部"], ["ok", "可用"], ["cool", "限流"], ["exp", "临期"], ["dead", "失效"], ["off", "停用"]]
     .map(([k, l]) => `<button class="${accFilter === k ? "on" : ""}" data-f="${k}">${l} <span class="mono" style="opacity:.65">${counts[k]}</span></button>`).join("");
   $$("#acc-filters button").forEach(b => b.addEventListener("click", () => { accFilter = b.dataset.f; accPage = 1; renderAccounts(); }));
 
@@ -725,6 +731,7 @@ function openImport() {
 function renderGateway() {
   const port = $("#gw-port").value || 8787;
   $("#gw-base").textContent = `http://127.0.0.1:${port}`;
+  renderTopo($("#topo-svg"));
   $("#map-tbl tbody").innerHTML = MAPS.map(m => `<tr>
     <td><span class="prio">${m.prio}</span></td>
     <td class="mono" style="font-weight:600;color:var(--t1)">${esc(m.bare)}</td>
@@ -745,21 +752,29 @@ function setGw(on) {
 
 /* ---- 用量 ---- */
 let usageRange = "近 7 天";
+/* 各时间窗的汇总口径（与按日聚合表/环图严格一致） */
+const RANGE_META = {
+  "今日": { req: "1,247", din: "1.62M", dout: "512K", dch: "178K", fail: 18, rate: "98.6%", ttfb: "412ms", chp: "11.1%", sub: "TODAY" },
+  "近 7 天": { req: "7,191", din: "8.90M", dout: "2.84M", dch: "0.89M", fail: 71, rate: "99.0%", ttfb: "434ms", chp: "10.0%", sub: "REQUESTS · 7D" },
+  "近 30 天": { req: "31,408", din: "38.6M", dout: "12.3M", dch: "3.90M", fail: 302, rate: "99.0%", ttfb: "441ms", chp: "10.1%", sub: "REQUESTS · 30D" },
+};
 function renderUsage() {
   $$("#usage-seg button").forEach(b => b.classList.toggle("on", b.dataset.r === usageRange));
   const set = USAGE_SETS[usageRange];
-  const mult = usageRange === "今日" ? 1 : usageRange === "近 7 天" ? 6.9 : 29.4;
-  $("#g-req").textContent = fmt(1247 * mult);
-  $("#g-in").textContent = (1.62 * mult).toFixed(1) + "M";
-  $("#g-out").textContent = (0.51 * mult).toFixed(1) + "M";
-  $("#g-ch").textContent = (0.18 * mult).toFixed(2) + "M";
-  $("#g-ttfb").textContent = "412ms";
-  $("#g-rate").textContent = usageRange === "今日" ? "98.4%" : "98.2%";
+  const meta = RANGE_META[usageRange];
+  $("#g-req").textContent = meta.req;
+  $("#g-in").textContent = meta.din;
+  $("#g-out").textContent = meta.dout;
+  $("#g-ch").textContent = meta.dch;
+  $("#g-chp").textContent = "占输入 " + meta.chp;
+  $("#g-ttfb").textContent = meta.ttfb;
+  $("#g-rate").textContent = meta.rate;
+  $("#g-fail").textContent = "失败 " + meta.fail + " 次";
   chartTrend($("#u-trend"), set, { h: 210 });
   $("#u-trend-legend").innerHTML = Object.keys(set.models).map(k => `<span class="li"><i style="background:${MODEL_COLOR[k]}"></i>${k}</span>`).join("");
   const series = chartBars($("#u-bars"), DAYS7.map((d, i) => ({ d, cin: TOK7[i].cin, cout: TOK7[i].cout, cch: TOK7[i].cch })), { h: 210 });
   $("#u-bars-legend").innerHTML = series.map(s => `<span class="li"><i style="background:${s[2]}"></i>${s[0]}</span>`).join("");
-  chartDonut($("#u-donut"), DONUT);
+  chartDonut($("#u-donut"), DONUT, { center: meta.req, centerSub: meta.sub });
   $("#u-donut-legend").innerHTML = DONUT.map(d => `<span class="li"><i style="background:${PROVIDERS[d.k].color}"></i>${PROVIDERS[d.k].name} <b style="color:var(--t2)">${d.v}%</b></span>`).join("");
   chartHbars($("#u-top"), TOPACCT);
   chartHisto($("#u-histo"));

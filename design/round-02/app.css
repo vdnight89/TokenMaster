@@ -335,8 +335,8 @@ select.inp { appearance: none; padding-right: 28px;
 .rlabel .rdot { width: 15px; height: 15px; border-radius: 50%; border: 1.5px solid var(--t4); flex: none; margin-top: 2px; position: relative; }
 .rlabel.on .rdot { border-color: var(--blue); }
 .rlabel.on .rdot::after { content: ""; position: absolute; inset: 2.5px; border-radius: 50%; background: var(--blue); }
-.rlabel .rt { font-size: 12.5px; font-weight: 600; }
-.rlabel .rd { font-size: 11.5px; color: var(--t3); margin-top: 1px; }
+.rlabel .rt { font-size: 12.5px; font-weight: 600; display: block; }
+.rlabel .rd { font-size: 11.5px; color: var(--t3); margin-top: 2px; line-height: 1.5; display: block; }
 
 /* ============ KPI 状态栏（zpool 式） ============ */
 .statusbar { display: grid; grid-template-columns: repeat(6, 1fr); }
@@ -461,9 +461,10 @@ table.tbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size
 
 /* 横向条形排行 */
 .hbars { display: flex; flex-direction: column; gap: 9px; }
-.hbar { display: grid; grid-template-columns: 118px 1fr 58px; align-items: center; gap: 10px; }
-.hbar .nm { font-size: 11.5px; color: var(--t2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); display: flex; align-items: center; gap: 6px; }
+.hbar { display: grid; grid-template-columns: 132px 1fr 58px; align-items: center; gap: 10px; }
+.hbar .nm { font-size: 11.5px; color: var(--t2); font-family: var(--mono); display: flex; align-items: center; gap: 6px; min-width: 0; }
 .hbar .nm i { width: 8px; height: 8px; border-radius: 2.5px; flex: none; }
+.hbar .nm span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .hbar .track { height: 14px; background: var(--card-2); border-radius: 4px; overflow: hidden; }
 .hbar .track b { display: block; height: 100%; border-radius: 4px; transition: width .7s cubic-bezier(.2,.8,.2,1); }
 .hbar .val { font-size: 11px; color: var(--t3); text-align: right; font-family: var(--mono); }

@@ -17,11 +17,11 @@
 
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
-| T1.1 | 领域类型：ChatRequest/Message/ToolCall/Usage/StreamChunk + serde | 1 | todo | T0.2 |
+| T1.1 | 领域类型：ChatRequest/Message/ToolCall/Usage/StreamChunk + serde | 1 | done(随T1.5建) | T0.2 |
 | T1.2 | 网关密钥：生成(sk-tm-)、持久化、鉴权中间件（Bearer；禁用模式；回环放行策略可配） | 1 | done(持久化待T2.1) | T0.2 |
-| T1.3 | 模型路由：`provider/model` 前缀强制 + 裸名映射表（可增删排序） | 1 | todo | T1.1 |
-| T1.4 | `GET /v1/models`：聚合各 provider 模型目录（provider/model 复合 id） | 1 | todo | T1.3 |
-| T1.5 | `POST /v1/chat/completions` 非流式（先接 mock provider 打通） | 1 | todo | T1.2, T1.3 |
+| T1.3 | 模型路由：`provider/model` 前缀强制 + 裸名映射表（可增删排序） | 1 | done | T1.1 |
+| T1.4 | `GET /v1/models`：聚合各 provider 模型目录（provider/model 复合 id） | 1 | done | T1.3 |
+| T1.5 | `POST /v1/chat/completions` 非流式（先接 mock provider 打通） | 1 | done | T1.2, T1.3 |
 | T1.6 | SSE 流式：chunk 序列、`[DONE]`、usage 统计、客户端断开中止上游 | 1 | todo | T1.5 |
 | T1.7 | think 标签拆分 + reasoning 双名归一 + 工具参数分片合并（消费层） | 1 | todo | T1.6 |
 | T1.8 | `POST /v1/messages`（Anthropic 面）：请求/响应/SSE 双向转换，`x-api-key` 鉴权 | 1 | todo | T1.6 |
