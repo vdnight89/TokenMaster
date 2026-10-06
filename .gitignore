@@ -20,3 +20,4 @@ design/round-01/shots/
 design/round-01/vendor/
 # Rust
 crates/target/
+tsconfig.tsbuildinfo
