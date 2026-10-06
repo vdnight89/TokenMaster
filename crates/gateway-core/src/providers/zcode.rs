@@ -27,6 +27,21 @@ use crate::route::Route;
 pub const DEFAULT_BASE: &str = "https://zcode.z.ai";
 pub const DEFAULT_CLIENT_VERSION: &str = "3.14.4";
 
+/// CLI 设备码登录流程句柄。
+pub struct ZcodeLoginFlow {
+    pub flow_id: String,
+    pub auth_url: String,
+    /// init 时自生成的 32 字节 hex（轮询沿用）。
+    bearer: String,
+}
+
+/// 余额（单位：token）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZcodeBalance {
+    pub total_tokens: u64,
+    pub used_tokens: u64,
+}
+
 /// start-plan 通道推理路径。
 const MESSAGES_PATH: &str = "/api/v1/zcode-plan/anthropic/v1/messages";
 
@@ -60,6 +75,108 @@ impl ZcodeProvider {
 
     pub fn production() -> Self {
         Self::new(DEFAULT_BASE.into())
+    }
+
+    /// CLI 设备码登录：init 拿授权链接（浏览器打开），轮询直到用户完成授权。
+    pub async fn login_init(&self) -> Result<ZcodeLoginFlow, ProviderError> {
+        let bearer = crate::key::random_id(32); // 32 字节 hex，一次性登录种子
+        let resp = self
+            .client
+            .post(format!("{}/api/v1/oauth/cli/init", self.base))
+            .bearer_auth(&bearer)
+            .json(&serde_json::json!({ "provider": "bigmodel" }))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status != 200 {
+            return Err(ProviderError::Upstream(format!("login init http {status}: {}", truncate(&text))));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| ProviderError::Upstream(format!("login init body: {e}")))?;
+        let flow_id = v
+            .get("flow_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Upstream("login init missing flow_id".into()))?
+            .to_string();
+        let auth_url = v
+            .get("url")
+            .or_else(|| v.get("auth_url"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(ZcodeLoginFlow { flow_id, auth_url, bearer })
+    }
+
+    /// 轮询一次：None = 用户尚未完成授权。
+    pub async fn login_poll(&self, flow: &ZcodeLoginFlow) -> Result<Option<Credential>, ProviderError> {
+        let resp = self
+            .client
+            .get(format!("{}/api/v1/oauth/cli/poll/{}", self.base, flow.flow_id))
+            .bearer_auth(&flow.bearer)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status != 200 {
+            return Err(ProviderError::Upstream(format!("login poll http {status}: {}", truncate(&text))));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| ProviderError::Upstream(format!("login poll body: {e}")))?;
+        match v.get("status").and_then(Value::as_str) {
+            Some("ok") | Some("succeeded") => {
+                let token = v
+                    .get("zcodejwttoken")
+                    .or_else(|| v.pointer("/token/zcodejwttoken"))
+                    .or_else(|| v.get("token"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ProviderError::Upstream("login poll ok but no token".into()))?;
+                Ok(Some(Credential {
+                    account_id: format!("zcode-{}", &flow.flow_id[..8.min(flow.flow_id.len())]),
+                    secret: token.to_string(),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// 完整登录：init + 轮询到拿到凭据（默认节奏由 `login` 提供）。
+    pub async fn login_with_interval(&self, interval: std::time::Duration) -> Result<Credential, ProviderError> {
+        let flow = self.login_init().await?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
+            if let Some(cred) = self.login_poll(&flow).await? {
+                return Ok(cred);
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(ProviderError::Upstream("login poll timeout (300s)".into()));
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
+
+    /// 余额（token 计）：需 Authorization + X-Device-Mid（identity_headers 已带）。
+    pub async fn balance(&self, cred: &Credential) -> Result<ZcodeBalance, ProviderError> {
+        let resp = self
+            .client
+            .get(format!("{}/api/v1/zcode-plan/billing/balance", self.base))
+            .headers(self.identity_headers(cred))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status != 200 {
+            return Err(ProviderError::Upstream(format!("balance http {status}: {}", truncate(&text))));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| ProviderError::Upstream(format!("balance body: {e}")))?;
+        Ok(ZcodeBalance {
+            total_tokens: v["data"]["total"].as_u64().unwrap_or(0),
+            used_tokens: v["data"]["used"].as_u64().unwrap_or(0),
+        })
     }
 
     /// 注入官方身份块（zcode-pool prompt.rs 从本机 ZCode 提取；真实上游必需）。
