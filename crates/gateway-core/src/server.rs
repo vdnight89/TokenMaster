@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::config::{AuthMode, GatewayConfig};
 use crate::error::ApiError;
@@ -78,6 +78,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(anthropic_messages))
         .route("/health", get(health))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
@@ -109,7 +110,8 @@ async fn chat_completions(
     let provider = state.providers.get(&route.provider).ok_or(ApiError::ModelNotFound)?.clone();
     if req.stream {
         let chunk_stream = provider.stream(&route, &req).await.map_err(provider_error)?;
-        Ok(openai_sse(chunk_stream, route.composite()).into_response())
+        let split = crate::consume::think_split(chunk_stream);
+        Ok(openai_sse(split, route.composite()).into_response())
     } else {
         let completion = provider.complete(&route, &req).await.map_err(provider_error)?;
         Ok(Json(serde_json::to_value(completion).expect("completion serializes")).into_response())
@@ -138,6 +140,16 @@ fn openai_sse(
             Ok(StreamChunk::Role) => base(json!({ "role": "assistant", "content": "" }), None),
             Ok(StreamChunk::Content(s)) => base(json!({ "content": s }), None),
             Ok(StreamChunk::Reasoning(s)) => base(json!({ "reasoning_content": s }), None),
+            Ok(StreamChunk::ToolCallDelta { index, id, name, arguments }) => {
+                let mut tc = json!({ "index": index, "function": { "arguments": arguments } });
+                if let Some(i) = id {
+                    tc["id"] = json!(i);
+                }
+                if let Some(n) = name {
+                    tc["function"]["name"] = json!(n);
+                }
+                base(json!({ "tool_calls": [tc] }), None)
+            }
             Ok(StreamChunk::Finish { reason, usage }) => {
                 *cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(usage);
                 base(json!({}), Some(&reason))
@@ -160,6 +172,65 @@ fn openai_sse(
     })
     .flatten();
     Sse::new(mapped.chain(tail)).keep_alive(KeepAlive::default())
+}
+
+/// Anthropic 协议面：请求转换 → 同一条 Provider 管线 → 响应/SSE 转换。
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    payload: Result<Json<crate::anthropic::AnthropicRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(areq) = payload.map_err(|_| ApiError::Message("invalid or missing JSON body".into()))?;
+    let stream = areq.stream;
+    let req = areq.into_chat_request();
+    let route = resolve_model(&req.model, &state.config.model_map)?;
+    let provider = state.providers.get(&route.provider).ok_or(ApiError::ModelNotFound)?.clone();
+    if stream {
+        let chunk_stream = provider.stream(&route, &req).await.map_err(provider_error)?;
+        let split = crate::consume::think_split(chunk_stream);
+        Ok(anthropic_sse(split, route.composite(), &req).into_response())
+    } else {
+        let completion = provider.complete(&route, &req).await.map_err(provider_error)?;
+        Ok(Json(crate::anthropic::message_from_completion(&completion)).into_response())
+    }
+}
+
+/// StreamChunk 流 → anthropic SSE 事件序列。
+fn anthropic_sse(
+    chunk_stream: crate::provider::ChunkStream,
+    model: String,
+    req: &crate::openai::ChatRequest,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let input_tokens: u64 = req
+        .messages
+        .iter()
+        .map(|m| (m.text().chars().count() as u64 / 2).max(1))
+        .sum();
+    let mut builder = crate::anthropic::AnthropicEventBuilder::new(model.clone(), input_tokens);
+    let start = builder.message_start();
+    let head = futures::stream::iter(vec![Ok::<_, Infallible>(
+        Event::default().event("message_start").data(serde_json::to_string(&start).expect("event serializes")),
+    )]);
+    let mapped = chunk_stream.flat_map(move |item| {
+        let events: Vec<Value> = match item {
+            Ok(crate::provider::StreamChunk::Role) => vec![],
+            Ok(crate::provider::StreamChunk::Content(s)) => builder.on_content(&s),
+            Ok(crate::provider::StreamChunk::Reasoning(s)) => builder.on_reasoning(&s),
+            Ok(crate::provider::StreamChunk::Finish { reason, usage }) => builder.on_finish(&reason, &usage),
+            Ok(crate::provider::StreamChunk::ToolCallDelta { .. }) => vec![], // 工具块在 M4 接入时补
+            Err(_) => vec![],
+        };
+        futures::stream::iter(
+            events
+                .into_iter()
+                .map(|v| {
+                    let name = v["type"].as_str().unwrap_or("event").to_string();
+                    let payload = serde_json::to_string(&v).expect("event serializes");
+                    Ok::<_, Infallible>(Event::default().event(name).data(payload))
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
+    Sse::new(head.chain(mapped)).keep_alive(KeepAlive::default())
 }
 
 /// Provider 故障映射为对外错误。M2 编排层在此之前完成换号重试；

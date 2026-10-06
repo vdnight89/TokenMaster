@@ -2,7 +2,9 @@
 //! OpenAI/Anthropic 协议兼容网关。纯库形态（ADR-0004），可在
 //! 测试进程内直接启动（缝 1：HTTP 黑盒）。
 
+pub mod anthropic;
 pub mod config;
+pub mod consume;
 pub mod error;
 pub mod key;
 pub mod mock;

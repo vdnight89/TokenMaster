@@ -11,7 +11,7 @@
 | T0.1 | Vite + React 19 + TS 前端骨架，原型 CSS/图标/格式化工具迁入，`pnpm build` 通过 | — | done | — |
 | T0.2 | Cargo workspace：`crates/gateway-core`（纯库）+ `src-tauri`（壳）骨架，`cargo test --workspace` 空passes | — | done(壳待T0.3) | rustup |
 | T0.3 | Tauri 2 壳接通：窗口起得来、前端加载、IPC ping/pong | — | todo | T0.1, T0.2 |
-| T0.4 | 前端 mock 数据层（移植原型 DATA：15 provider/42 账号/用量/日志），供 GUI 先行开发 | — | doing(agent) | T0.1 |
+| T0.4 | 前端 mock 数据层（移植原型 DATA：15 provider/42 账号/用量/日志），供 GUI 先行开发 | — | done(agent) | T0.1 |
 
 ## M1 网关核心 · OpenAI/Anthropic 面（缝 1：HTTP 黑盒）
 
@@ -22,9 +22,9 @@
 | T1.3 | 模型路由：`provider/model` 前缀强制 + 裸名映射表（可增删排序） | 1 | done | T1.1 |
 | T1.4 | `GET /v1/models`：聚合各 provider 模型目录（provider/model 复合 id） | 1 | done | T1.3 |
 | T1.5 | `POST /v1/chat/completions` 非流式（先接 mock provider 打通） | 1 | done | T1.2, T1.3 |
-| T1.6 | SSE 流式：chunk 序列、`[DONE]`、usage 统计、客户端断开中止上游 | 1 | todo | T1.5 |
-| T1.7 | think 标签拆分 + reasoning 双名归一 + 工具参数分片合并（消费层） | 1 | todo | T1.6 |
-| T1.8 | `POST /v1/messages`（Anthropic 面）：请求/响应/SSE 双向转换，`x-api-key` 鉴权 | 1 | todo | T1.6 |
+| T1.6 | SSE 流式：chunk 序列、`[DONE]`、usage 统计、客户端断开中止上游 | 1 | done(断开中止待M2) | T1.5 |
+| T1.7 | think 标签拆分 + reasoning 双名归一 + 工具参数分片合并（消费层） | 1 | done | T1.6 |
+| T1.8 | `POST /v1/messages`（Anthropic 面）：请求/响应/SSE 双向转换，`x-api-key` 鉴权 | 1 | done | T1.6 |
 
 ## M2 令牌池（缝 1 观察行为）
 
@@ -70,15 +70,15 @@
 
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
-| T5.1 | 布局壳：顶栏+药丸导航+7 页路由+页面切换动效+toasts | — | todo | T0.1, T0.4 |
-| T5.2 | 图表库移植（11 类 SVG 图表为 React 组件） | — | todo | T0.4 |
-| T5.3 | 仪表盘页：KPI 条/待办/吞吐/池仪表/错误分布/最近请求 | — | todo | T5.1, T5.2 |
-| T5.4 | 账号页：筛选/搜索/分页/账号卡/行内操作/状态卡 | — | todo | T5.1 |
-| T5.5 | 添加账号模态（四类登录引导）+ zcode-pool 导入模态 + 领取(验证码载体)模态 | — | todo | T5.4 |
-| T5.6 | 网关页：启停/端口/base_url/密钥卡/映射表/选号策略/拓扑图 | — | todo | T5.1, T5.2 |
-| T5.7 | 用量页：分段/汇总卡/四类图表/聚合表 | — | todo | T5.2 |
-| T5.8 | 日志页：过滤/监控表/行展开换号轨迹 | — | todo | T5.1 |
-| T5.9 | 接入页 + 设置页（代理三级覆盖 UI） | — | todo | T5.1 |
+| T5.1 | 布局壳：顶栏+药丸导航+7 页路由+页面切换动效+toasts | — | done(agent) | T0.1, T0.4 |
+| T5.2 | 图表库移植（11 类 SVG 图表为 React 组件） | — | done(agent) | T0.4 |
+| T5.3 | 仪表盘页：KPI 条/待办/吞吐/池仪表/错误分布/最近请求 | — | done(agent) | T5.1, T5.2 |
+| T5.4 | 账号页：筛选/搜索/分页/账号卡/行内操作/状态卡 | — | done(agent) | T5.1 |
+| T5.5 | 添加账号模态（四类登录引导）+ zcode-pool 导入模态 + 领取(验证码载体)模态 | — | done(agent) | T5.4 |
+| T5.6 | 网关页：启停/端口/base_url/密钥卡/映射表/选号策略/拓扑图 | — | done(agent) | T5.1, T5.2 |
+| T5.7 | 用量页：分段/汇总卡/四类图表/聚合表 | — | done(agent) | T5.2 |
+| T5.8 | 日志页：过滤/监控表/行展开换号轨迹 | — | done(agent) | T5.1 |
+| T5.9 | 接入页 + 设置页（代理三级覆盖 UI） | — | done(agent) | T5.1 |
 | T5.10 | i18n 双语（zh/en 词条表 + t()，与 Rust 错误词表对齐） | — | todo | T5.3-T5.9 |
 | T5.11 | IPC 接线：mock 数据逐页替换为 Tauri command 真数据 | — | todo | T0.3, M1-M3, T5.3-T5.9 |
 

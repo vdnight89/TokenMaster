@@ -9,7 +9,7 @@ use crate::route::Route;
 use async_trait::async_trait;
 use futures::Stream;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderError {
     /// 账号/凭据问题——编排层应换号重试（401/402/403 语义）。
     #[error("credential rejected: {0}")]
@@ -32,6 +32,8 @@ pub enum StreamChunk {
     Role,
     Content(String),
     Reasoning(String),
+    /// OpenAI 形态的工具调用增量分片（index 稳定；id/name 仅首片携带）。
+    ToolCallDelta { index: u64, id: Option<String>, name: Option<String>, arguments: String },
     Finish { reason: String, usage: Usage },
 }
 
