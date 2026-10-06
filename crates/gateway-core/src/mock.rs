@@ -2,7 +2,7 @@
 //! 行为可预测：回显最后一条用户消息并附路由信息，用量按字符数估算。
 
 use crate::openai::{ChatCompletion, ChatRequest, Usage};
-use crate::provider::{ChunkStream, Provider, ProviderError, StreamChunk};
+use crate::provider::{ChunkStream, Credential, Provider, ProviderError, StreamChunk};
 use crate::registry::{ModelInfo, ProviderCatalog};
 use crate::route::Route;
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ fn approx_tokens(s: &str) -> u64 {
 }
 
 impl MockProvider {
-    fn plan(&self, route: &Route, req: &ChatRequest) -> (String, Usage) {
+    fn plan(&self, _cred: &Credential, route: &Route, req: &ChatRequest) -> (String, Usage) {
         let last_user = req
             .messages
             .iter()
@@ -47,13 +47,13 @@ impl Provider for MockProvider {
         }
     }
 
-    async fn complete(&self, route: &Route, req: &ChatRequest) -> Result<ChatCompletion, ProviderError> {
-        let (content, usage) = self.plan(route, req);
+    async fn complete(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChatCompletion, ProviderError> {
+        let (content, usage) = self.plan(cred, route, req);
         Ok(ChatCompletion::new(route.composite(), content, usage))
     }
 
-    async fn stream(&self, route: &Route, req: &ChatRequest) -> Result<ChunkStream, ProviderError> {
-        let (content, usage) = self.plan(route, req);
+    async fn stream(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChunkStream, ProviderError> {
+        let (content, usage) = self.plan(cred, route, req);
         // 分约 3 段产出，末段前稍作停顿，模拟真实上游节奏。
         let per = content.chars().count().div_ceil(3).max(1);
         let mut pieces: Vec<String> = Vec::new();

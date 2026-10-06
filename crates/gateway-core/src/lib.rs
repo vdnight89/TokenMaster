@@ -5,11 +5,18 @@
 pub mod anthropic;
 pub mod config;
 pub mod consume;
+pub mod crypto;
 pub mod error;
 pub mod key;
 pub mod mock;
 pub mod openai;
+pub mod orchestrate;
+pub mod pool;
 pub mod provider;
+pub mod refresh;
 pub mod registry;
 pub mod route;
 pub mod server;
+pub mod store;
+
+pub use provider::Credential;

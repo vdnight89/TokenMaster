@@ -24,10 +24,10 @@ impl Provider for Scripted {
     fn catalog(&self) -> ProviderCatalog {
         ProviderCatalog { id: "mock".into(), models: vec![ModelInfo { id: "mock-alpha".into() }] }
     }
-    async fn complete(&self, _r: &Route, _q: &ChatRequest) -> Result<gateway_core::openai::ChatCompletion, ProviderError> {
+    async fn complete(&self, _c: &gateway_core::Credential, _r: &Route, _q: &ChatRequest) -> Result<gateway_core::openai::ChatCompletion, ProviderError> {
         unimplemented!("think 拆分测试只走流式")
     }
-    async fn stream(&self, _r: &Route, _q: &ChatRequest) -> Result<ChunkStream, ProviderError> {
+    async fn stream(&self, _c: &gateway_core::Credential, _r: &Route, _q: &ChatRequest) -> Result<ChunkStream, ProviderError> {
         let pieces = self.0.clone();
         Ok(Box::pin(futures::stream::iter(
             pieces.into_iter().map(|p| Ok(StreamChunk::Content(p))).collect::<Vec<_>>(),
@@ -108,8 +108,8 @@ async fn reasoning_chunks_from_provider_pass_through_untouched() {
     impl Provider for R {
         fn id(&self) -> &str { "mock" }
         fn catalog(&self) -> ProviderCatalog { ProviderCatalog { id: "mock".into(), models: vec![ModelInfo { id: "mock-alpha".into() }] } }
-        async fn complete(&self, _r: &Route, _q: &ChatRequest) -> Result<gateway_core::openai::ChatCompletion, ProviderError> { unimplemented!() }
-        async fn stream(&self, _r: &Route, _q: &ChatRequest) -> Result<ChunkStream, ProviderError> {
+        async fn complete(&self, _c: &gateway_core::Credential, _r: &Route, _q: &ChatRequest) -> Result<gateway_core::openai::ChatCompletion, ProviderError> { unimplemented!() }
+        async fn stream(&self, _c: &gateway_core::Credential, _r: &Route, _q: &ChatRequest) -> Result<ChunkStream, ProviderError> {
             Ok(Box::pin(futures::stream::iter(self.0.clone())))
         }
     }

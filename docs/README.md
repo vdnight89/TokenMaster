@@ -26,7 +26,7 @@
 
 | 资产 | 内容 |
 |---|---|
-| [../design/round-02/](../design/round-02/) | **UI 实现基准**：AM 式暗色控制台原型（7 页/11 图表/完整交互），design-notes.md 为设计说明 |
+| [../design/round-02/](../design/round-02/) | **UI 实现基准**：AM 式暗色控制台原型（7 页/11 图表/完整交互），design-notes.md 为设计说明；原型源码（app.js/app.css/index.html）已移植完成后归档为 `prototype.zip`，页面截图在 `shots/` |
 | [../design/round-01/](../design/round-01/) | 方向探索存档（对比页 + 三方向，已被 round-02 取代） |
 
 ## 约定

@@ -17,84 +17,63 @@ pub enum ApiError {
     RateLimited { retry_after_secs: Option<u64>, msg: String },
     #[error("upstream error ({code}): {msg}")]
     Upstream { status: u16, code: String, msg: String },
+    #[error("no available account for provider {provider}")]
+    NoAvailableAccount { provider: String },
+    #[error("all accounts failed after retries: {0}")]
+    RetryExhausted(String),
 }
 
 impl ApiError {
-    fn parts(self) -> (StatusCode, String, String) {
+    fn fields(&self) -> (StatusCode, String, String) {
         match self {
             ApiError::InvalidApiKey => (
                 StatusCode::UNAUTHORIZED,
                 "invalid_api_key".into(),
-                "invalid or missing gateway key".into(),
+                self.to_string(),
             ),
             ApiError::ModelNotFound => (
                 StatusCode::NOT_FOUND,
                 "model_not_found".into(),
-                "model not found: no route for this model name".into(),
+                self.to_string(),
             ),
-            ApiError::Message(m) => (
+            ApiError::Message(_) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error".into(),
-                m,
+                self.to_string(),
             ),
             ApiError::RateLimited { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited".into(),
                 self.to_string(),
             ),
-            ApiError::Upstream { status, .. } => {
-                let code = match status {
-                    401 => "provider_credentials_rejected",
-                    402 => "provider_payment_required",
-                    403 => "provider_forbidden",
-                    _ => "upstream_error",
-                };
-                let s = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-                (s, code.to_string(), self.to_string())
-            }
+            ApiError::Upstream { status, code, .. } => (
+                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
+                code.clone(),
+                self.to_string(),
+            ),
+            ApiError::NoAvailableAccount { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_available_account".into(),
+                self.to_string(),
+            ),
+            ApiError::RetryExhausted(_) => (
+                StatusCode::BAD_GATEWAY,
+                "retry_exhausted".into(),
+                self.to_string(),
+            ),
         }
     }
 }
 
 /// 错误体（与 HTTP 响应同一 JSON 形状），供单元断言与日志使用。
 pub fn error_json(e: &ApiError) -> Value {
-    let (_, code, message) = match e {
-        ApiError::InvalidApiKey => (
-            StatusCode::UNAUTHORIZED,
-            "invalid_api_key".to_string(),
-            "invalid or missing gateway key".to_string(),
-        ),
-        ApiError::ModelNotFound => (
-            StatusCode::NOT_FOUND,
-            "model_not_found".to_string(),
-            "model not found: no route for this model name".to_string(),
-        ),
-        ApiError::Message(m) => (StatusCode::BAD_REQUEST, "invalid_request_error".into(), m.clone()),
-        ApiError::RateLimited { .. } => (
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited".into(),
-            e.to_string(),
-        ),
-        ApiError::Upstream { status, .. } => {
-            let code = match status {
-                401 => "provider_credentials_rejected",
-                402 => "provider_payment_required",
-                403 => "provider_forbidden",
-                _ => "upstream_error",
-            };
-            (
-                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
-                code.to_string(),
-                e.to_string(),
-            )
-        }
-    };
+    let (_, code, message) = e.fields();
     json!({ "error": { "message": message, "type": "invalid_request_error", "code": code } })
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, code, message) = self.parts();
+        let (status, code, message) = self.fields();
         (
             status,
             Json(json!({

@@ -39,14 +39,44 @@ pub enum StreamChunk {
 
 pub type ChunkStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, ProviderError>> + Send>>;
 
+/// 一次调用的账号凭据：编排层从池中选出账号后注入。
+#[derive(Debug, Clone)]
+pub struct Credential {
+    pub account_id: String,
+    pub secret: String,
+}
+
+impl Credential {
+    /// 无池直连模式（内部直调/单账号 provider）。
+    pub fn direct() -> Self {
+        Self { account_id: "direct".into(), secret: String::new() }
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
     fn catalog(&self) -> ProviderCatalog;
 
     /// 非流式补全。
-    async fn complete(&self, route: &Route, req: &ChatRequest) -> Result<ChatCompletion, ProviderError>;
+    async fn complete(
+        &self,
+        cred: &Credential,
+        route: &Route,
+        req: &ChatRequest,
+    ) -> Result<ChatCompletion, ProviderError>;
 
     /// 流式补全：返回增量流；流自然结束前应产出 `Finish`。
-    async fn stream(&self, route: &Route, req: &ChatRequest) -> Result<ChunkStream, ProviderError>;
+    async fn stream(
+        &self,
+        cred: &Credential,
+        route: &Route,
+        req: &ChatRequest,
+    ) -> Result<ChunkStream, ProviderError>;
+
+    /// 凭据续期；不可续期的 provider 保持默认（返回 BadRequest），
+    /// 调度器对这类账号只探测不更新。
+    async fn refresh(&self, _cred: &Credential) -> Result<Credential, ProviderError> {
+        Err(ProviderError::BadRequest("provider does not support refresh".into()))
+    }
 }

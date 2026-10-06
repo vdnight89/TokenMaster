@@ -13,3 +13,8 @@
 - 2026-10-06 T1.7 TDD：消费层 8 测——流式 think 拆分（开标签嗅探+闭标签跨 chunk）3、非流式 split_think（最后闭标签/裸闭/无标签/未闭合开标签）4、reasoning 双名归一 1；ToolCallDelta 变体入 StreamChunk。
 - 2026-10-06 T1.8 TDD：Anthropic /v1/messages 3 测（message 形状/SSE 事件序列无 [DONE]/x-api-key 鉴权）；anthropic.rs 转换层 + AnthropicEventBuilder。
 - 2026-10-06 M1 集成关卡：cargo test --workspace 10 套件 31 测全绿 + clippy 0 警告 + pnpm check/build 绿。提交并推送。
+- 2026-10-07 T2.1 TDD：Store（enc:v1 AES-256-GCM/原子写/篡改跳过/删除）+ crypto 5 测。
+- 2026-10-07 T2.2+T2.4 TDD：池选号（先到期/剩余最多/tried 排除/账号级+模型级冷却/停用失效过滤/Shortage 区分）6 测。
+- 2026-10-07 T2.3 TDD：编排器（429 模型级冷却换号/401 标失效换号/BadRequest 立即中止/全部限流 429 vs 无账号 503/预算耗尽带最后错误）+ Provider trait 增加 Credential 参数 + start_pooled 端到端 7 测。
+- 2026-10-07 T2.5 TDD：刷新调度（续期不看 enabled/不可续期只探测/失败标失效）3 测。
+- 2026-10-07 M2 集成关卡：workspace 52 测全绿 + clippy 0 警告 + pnpm build 绿。另：应用户要求处理 mimosa 拦截——round-02 原型源码（已 100% 移植）归档为 prototype.zip 并移除散文件，消除提交扫描的持续误报源；宿主级 mimosa 开关需在 ZCode 插件设置里禁用。

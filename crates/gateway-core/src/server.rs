@@ -21,13 +21,15 @@ use serde_json::{json, Value};
 use crate::config::{AuthMode, GatewayConfig};
 use crate::error::ApiError;
 use crate::openai::{ChatRequest, Usage};
-use crate::provider::{Provider, ProviderError, StreamChunk};
+use crate::provider::{Credential, Provider, ProviderError, StreamChunk};
 use crate::route::resolve_model;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: GatewayConfig,
     pub providers: HashMap<String, Arc<dyn Provider>>,
+    /// 每 Provider 一张令牌池；未配置的 Provider 走无池直连。
+    pub pools: HashMap<String, Arc<std::sync::Mutex<crate::pool::TokenPool>>>,
 }
 
 pub struct GatewayHandle {
@@ -53,12 +55,30 @@ pub async fn start_with(
     config: GatewayConfig,
     providers: Vec<Arc<dyn Provider>>,
 ) -> std::io::Result<GatewayHandle> {
+    start_full(config, providers, HashMap::new()).await
+}
+
+/// 启动网关：单 Provider + 其令牌池（池化编排路径的测试入口）。
+pub async fn start_pooled(
+    config: GatewayConfig,
+    provider: Arc<dyn Provider>,
+    pool: Arc<std::sync::Mutex<crate::pool::TokenPool>>,
+) -> std::io::Result<GatewayHandle> {
+    let id = provider.id().to_string();
+    start_full(config, vec![provider], HashMap::from([(id, pool)])).await
+}
+
+pub async fn start_full(
+    config: GatewayConfig,
+    providers: Vec<Arc<dyn Provider>>,
+    pools: HashMap<String, Arc<std::sync::Mutex<crate::pool::TokenPool>>>,
+) -> std::io::Result<GatewayHandle> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
     let providers: HashMap<String, Arc<dyn Provider>> =
         providers.into_iter().map(|p| (p.id().to_string(), p)).collect();
-    let state = AppState { config, providers };
+    let state = AppState { config, providers, pools };
     let app = router(state);
     tokio::spawn(async move {
         let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -108,12 +128,23 @@ async fn chat_completions(
     let Json(req) = payload.map_err(|_| ApiError::Message("invalid or missing JSON body".into()))?;
     let route = resolve_model(&req.model, &state.config.model_map)?;
     let provider = state.providers.get(&route.provider).ok_or(ApiError::ModelNotFound)?.clone();
+    if let Some(pool) = state.pools.get(&route.provider) {
+        let completion =
+            crate::orchestrate::complete_with_retry(pool, provider.as_ref(), &route, &req).await?;
+        return Ok(Json(serde_json::to_value(completion).expect("completion serializes")).into_response());
+    }
     if req.stream {
-        let chunk_stream = provider.stream(&route, &req).await.map_err(provider_error)?;
+        let chunk_stream = provider
+            .stream(&Credential::direct(), &route, &req)
+            .await
+            .map_err(provider_error)?;
         let split = crate::consume::think_split(chunk_stream);
         Ok(openai_sse(split, route.composite()).into_response())
     } else {
-        let completion = provider.complete(&route, &req).await.map_err(provider_error)?;
+        let completion = provider
+            .complete(&Credential::direct(), &route, &req)
+            .await
+            .map_err(provider_error)?;
         Ok(Json(serde_json::to_value(completion).expect("completion serializes")).into_response())
     }
 }
@@ -185,11 +216,17 @@ async fn anthropic_messages(
     let route = resolve_model(&req.model, &state.config.model_map)?;
     let provider = state.providers.get(&route.provider).ok_or(ApiError::ModelNotFound)?.clone();
     if stream {
-        let chunk_stream = provider.stream(&route, &req).await.map_err(provider_error)?;
+        let chunk_stream = provider
+            .stream(&Credential::direct(), &route, &req)
+            .await
+            .map_err(provider_error)?;
         let split = crate::consume::think_split(chunk_stream);
         Ok(anthropic_sse(split, route.composite(), &req).into_response())
     } else {
-        let completion = provider.complete(&route, &req).await.map_err(provider_error)?;
+        let completion = provider
+            .complete(&Credential::direct(), &route, &req)
+            .await
+            .map_err(provider_error)?;
         Ok(Json(crate::anthropic::message_from_completion(&completion)).into_response())
     }
 }
