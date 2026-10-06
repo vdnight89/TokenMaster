@@ -42,6 +42,31 @@ pub struct ZcodeBalance {
     pub used_tokens: u64,
 }
 
+/// 可领套餐（entitlements 里 meter=model_usage 且 unit_type=token 的量）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZcodePlan {
+    pub plan_id: String,
+    pub title: String,
+    pub tokens: u64,
+}
+
+/// 阿里云验证码凭据（T6.3 载体产出；param 本地校验长度 ≥200，不合格不发）。
+#[derive(Debug, Clone)]
+pub struct CaptchaParam {
+    pub param: String,
+    pub region: String,
+}
+
+/// 领取结果。3007 是预期内的「先探后取」状态，不算错误。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClaimOutcome {
+    Claimed { ends_at: String },
+    AlreadyClaimed,
+    Cooldown { next_at: String },
+    NeedCaptcha,
+    NoPlans,
+}
+
 /// start-plan 通道推理路径。
 const MESSAGES_PATH: &str = "/api/v1/zcode-plan/anthropic/v1/messages";
 
@@ -177,6 +202,154 @@ impl ZcodeProvider {
             total_tokens: v["data"]["total"].as_u64().unwrap_or(0),
             used_tokens: v["data"]["used"].as_u64().unwrap_or(0),
         })
+    }
+
+    /// 补激活事件（app_launch/app_daily_active/app_login_success）——
+    /// 不补则 preview 恒空（「每日随机派发」实为按活跃信号决定）。
+    pub async fn report_activity(&self, cred: &Credential) -> Result<(), ProviderError> {
+        let events: Vec<Value> = ["app_launch", "app_daily_active", "app_login_success"]
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "user_id": cred.account_id,
+                    "device_mid": self.device_mid,
+                })
+            })
+            .collect();
+        let resp = self
+            .client
+            .post(format!("{}/api/v1/event/report", self.base))
+            .headers(self.identity_headers(cred))
+            .json(&serde_json::json!({ "events": events }))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status != 200 {
+            return Err(ProviderError::Upstream(format!("event report http {status}: {}", truncate(&text))));
+        }
+        Ok(())
+    }
+
+    /// 可领套餐列表。
+    pub async fn claim_preview(&self, cred: &Credential) -> Result<Vec<ZcodePlan>, ProviderError> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/api/v1/zcode-plan/billing/preview?app_version={}&platform=win32",
+                self.base, self.version
+            ))
+            .headers(self.identity_headers(cred))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status != 200 {
+            return Err(ProviderError::Upstream(format!("preview http {status}: {}", truncate(&text))));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| ProviderError::Upstream(format!("preview body: {e}")))?;
+        let mut plans = Vec::new();
+        if let Some(arr) = v.pointer("/data/plans").and_then(Value::as_array) {
+            for p in arr {
+                let plan_id = p
+                    .get("plan_id")
+                    .or_else(|| p.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if plan_id.is_empty() {
+                    continue;
+                }
+                let title = p
+                    .get("title")
+                    .or_else(|| p.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let tokens: u64 = p
+                    .get("entitlements")
+                    .and_then(Value::as_array)
+                    .map(|ents| {
+                        ents.iter()
+                            .filter(|e| {
+                                e.get("meter").and_then(Value::as_str) == Some("model_usage")
+                                    && e.get("unit_type").and_then(Value::as_str) == Some("token")
+                            })
+                            .filter_map(|e| {
+                                e.get("amount").and_then(Value::as_u64).or_else(|| {
+                                    e.get("amount").and_then(Value::as_str).and_then(|s| s.parse().ok())
+                                })
+                            })
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                plans.push(ZcodePlan { plan_id, title, tokens });
+            }
+        }
+        Ok(plans)
+    }
+
+    /// 提交领取。无 captcha 时先探（3007 → NeedCaptcha）；带 captcha 时先本地校验
+    /// param 长度 ≥200（dsh 实测：不合格 param 在索要窗口必 3007，不发）。
+    pub async fn submit_claim(
+        &self,
+        cred: &Credential,
+        plan_id: &str,
+        captcha: Option<&CaptchaParam>,
+    ) -> Result<ClaimOutcome, ProviderError> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/v1/zcode-plan/billing/claim", self.base))
+            .headers(self.identity_headers(cred))
+            .json(&serde_json::json!({ "plan_id": plan_id }));
+        if let Some(cap) = captcha {
+            if cap.param.len() < 200 {
+                return Ok(ClaimOutcome::NeedCaptcha);
+            }
+            req = req
+                .header("x-aliyun-captcha-verify-param", &cap.param)
+                .header("x-aliyun-captcha-verify-region", &cap.region);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status != 200 {
+            return Err(ProviderError::Upstream(format!("claim http {status}: {}", truncate(&text))));
+        }
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| ProviderError::Upstream(format!("claim body: {e}")))?;
+        let ends_at = || {
+            v.pointer("/data/plan/ends_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        match v.get("code").and_then(Value::as_i64) {
+            Some(0) => Ok(ClaimOutcome::Claimed { ends_at: ends_at() }),
+            Some(1003) => Ok(ClaimOutcome::AlreadyClaimed),
+            Some(1005) => Ok(ClaimOutcome::Cooldown { next_at: ends_at() }),
+            Some(3007) => Ok(ClaimOutcome::NeedCaptcha),
+            Some(code) => Err(ProviderError::Upstream(format!("claim code {code}: {}", truncate(&text)))),
+            None => Err(ProviderError::Upstream(format!("claim no code: {}", truncate(&text)))),
+        }
+    }
+
+    /// 每日领取编排：补事件 → preview → 第一档先探（无验证码头）。
+    /// NeedCaptcha 时由 T6.3 验证码载体产出 param 后调 submit_claim 重发。
+    pub async fn claim_daily(&self, cred: &Credential) -> Result<ClaimOutcome, ProviderError> {
+        self.report_activity(cred).await?;
+        let plans = self.claim_preview(cred).await?;
+        let Some(first) = plans.first() else {
+            return Ok(ClaimOutcome::NoPlans);
+        };
+        self.submit_claim(cred, &first.plan_id, None).await
     }
 
     /// 注入官方身份块（zcode-pool prompt.rs 从本机 ZCode 提取；真实上游必需）。

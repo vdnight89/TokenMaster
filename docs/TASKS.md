@@ -50,7 +50,7 @@
 
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
-| T4.1 | zcode：双通道(anthropic)、CLI 设备码登录、伪装头、3007→验证码事件、套餐领取、积分/额度 | 2 | doing(a/b 推理双模式 + c 登录/余额 done；领取+验证码事件待续，与 T6.3 载体联动) | M1, M2 |
+| T4.1 | zcode：双通道(anthropic)、CLI 设备码登录、伪装头、3007→验证码事件、套餐领取、积分/额度 | 2 | done(验证码载体本体在 T6.3；claim 的 NeedCaptcha 接口已就绪) | M1, M2 |
 | T4.2 | gemini：CloudCode 上游、OAuth 回调、双层信封、thoughtSignature、Antigravity 身份 | 2 | todo | M1, M2 |
 | T4.3 | commandcode：私有信封、每 key 设备指纹(HMAC)、SSE 转译、user_ key 透传 | 2 | todo | M1, M2 |
 | T4.4 | trae：SOLO 载荷/SSE、本地回调 18080、Cloud-IDE-JWT | 2 | todo | M1, M2 |
