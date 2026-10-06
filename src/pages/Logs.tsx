@@ -1,6 +1,7 @@
 /** 日志页：快捷过滤 + 监控表 + 行展开换号轨迹（对应原型 #page-logs / renderLogs） */
 import { Fragment, useState } from "react";
 import { Ic } from "../lib/icons";
+import { ModelBrandIcon } from "../lib/brand";
 import { LOGS } from "../lib/mock";
 import type { LogEntry, TrailStep } from "../lib/mock";
 
@@ -101,7 +102,10 @@ export function LogRow({ r, expanded, onToggle }: { r: LogEntry; expanded?: bool
           {r.proto === "gateway" ? "GW" : "POST"}
         </td>
         <td>
-          <span className="model">{r.model}</span>
+          <span className="model" style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+            <ModelBrandIcon model={r.model} size={13} />
+            {r.model}
+          </span>
         </td>
         <td>
           <span className="acct">{r.acct}</span>

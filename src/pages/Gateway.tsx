@@ -2,9 +2,17 @@
 import { useState } from "react";
 import { Ic } from "../lib/icons";
 import { CopyBtn } from "../lib/ui";
-import { KEY_FULL, KEY_MASKED, MAPS } from "../lib/mock";
+import { ProviderGlyphIcon } from "../lib/brand";
+import { KEY_FULL, KEY_MASKED, MAPS, PROVIDERS } from "../lib/mock";
+import type { PvKey } from "../lib/mock";
 import { fmt } from "../lib/fmt";
 import { Topo } from "../charts/Topo";
+
+/** 映射目标 "provider / model" 前缀 → PvKey（不合法返回 null） */
+function toPv(to: string): PvKey | null {
+  const k = to.split(" / ")[0] as PvKey;
+  return k in PROVIDERS ? k : null;
+}
 
 export default function Gateway({ gwOn, onToggleGw }: { gwOn: boolean; onToggleGw: () => void }) {
   const [port, setPort] = useState("8787");
@@ -156,7 +164,10 @@ export default function Gateway({ gwOn, onToggleGw }: { gwOn: boolean; onToggleG
                     <Ic name="arrowR" size={13} />
                   </td>
                   <td className="mono" style={{ color: "var(--t3)", fontSize: "11.5px" }}>
-                    {m.to}
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+                      {toPv(m.to) ? <ProviderGlyphIcon provider={toPv(m.to)!} size={13} /> : null}
+                      {m.to}
+                    </span>
                   </td>
                   <td className="num" style={{ color: "var(--t3)" }}>
                     {fmt(m.hits)}

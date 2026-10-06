@@ -76,5 +76,6 @@ TokenMaster 把这些问题收敛进一个 Windows 桌面应用：在本机回�
 | `commandcode-proxy-master` | commandcode 协议参考（Node） | MIT |
 | `zcode-pool` | GUI 信息架构、ZCode 凭据加密兼容、i18n 方案参考 | MIT |
 | `Antigravity-Manager-main` | **Rust 代码直接复用**（令牌池/OAuth/重试换号等模块） | CC-BY-NC-SA-4.0 |
+| `@lobehub/icons` | GUI 的 Provider / 模型品牌图标（内联 SVG 子集） | MIT |
 
-因直接复用了 Antigravity-Manager 的代码，本项目含其衍生代码的部分遵循 **CC-BY-NC-SA-4.0**（详见 [LICENSE](./LICENSE) 与 [ADR-0002](./docs/adr/0002-reuse-antigravity-manager-code.md)）。
+因直接复用了 Antigravity-Manager 的代码，本项目含其衍生代码的部分遵循 **CC-BY-NC-SA-4.0**（详见 [LICENSE](./LICENSE) 与 [ADR-0002](./docs/adr/0002-reuse-antigravity-manager-code.md)）。品牌图标来自 LobeHub Icons（MIT，Copyright © 2023 LobeHub；各图标商标归其各自所有者）。

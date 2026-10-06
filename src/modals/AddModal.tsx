@@ -3,7 +3,9 @@ import { useState } from "react";
 import { Ic } from "../lib/icons";
 import { toast } from "../lib/toast";
 import { CopyBtn } from "../lib/ui";
+import { ProviderBrandIcon } from "../lib/brand";
 import { PROVIDERS, PV_KEYS } from "../lib/mock";
+import type { PvKey } from "../lib/mock";
 
 type AddStep = "pick" | "paste" | "flow";
 
@@ -16,6 +18,7 @@ const OPTS = [
 
 export default function AddModal({ onClose }: { onClose: () => void }) {
   const [step, setStep] = useState<AddStep>("pick");
+  const [pv, setPv] = useState<PvKey>("zcode");
   return (
     <div
       className="ov open"
@@ -38,13 +41,21 @@ export default function AddModal({ onClose }: { onClose: () => void }) {
             <>
               <div className="fld" style={{ marginBottom: 12 }}>
                 <span className="up">选择 Provider</span>
-                <select className="inp" style={{ width: "100%" }}>
-                  {PV_KEYS.map(k => (
-                    <option key={k} value={k}>
-                      {PROVIDERS[k].name}
-                    </option>
-                  ))}
-                </select>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <select
+                    className="inp"
+                    style={{ flex: 1 }}
+                    value={pv}
+                    onChange={e => setPv(e.target.value as PvKey)}
+                  >
+                    {PV_KEYS.map(k => (
+                      <option key={k} value={k}>
+                        {PROVIDERS[k].name}
+                      </option>
+                    ))}
+                  </select>
+                  <ProviderBrandIcon provider={pv} size={24} />
+                </div>
               </div>
               <span className="up">登录方式（按 Provider 能力自动给出）</span>
               <div className="mt-s">

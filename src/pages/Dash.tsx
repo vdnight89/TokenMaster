@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { Ic } from "../lib/icons";
 import { toast } from "../lib/toast";
+import { ProviderBrandIcon, ProviderGlyphIcon } from "../lib/brand";
 import type { ModalKind } from "../lib/ui";
 import type { PageKey } from "../lib/nav";
 import { ERR_SEG, LOGS, POOLS, PROVIDERS, TODOS } from "../lib/mock";
@@ -180,13 +181,10 @@ export default function Dash({
           </div>
           <div className="todos">
             {TODOS.map(t => {
-              const pv = PROVIDERS[t.pv];
               const done = doneTodos.has(t.id);
               return (
                 <div className={"todo" + (done ? " done" : "")} data-id={t.id} key={t.id}>
-                  <div className="pv" style={{ background: pv.color }}>
-                    {pv.name[0]}
-                  </div>
+                  <ProviderBrandIcon provider={t.pv} />
                   <div className="tx grow">
                     <div className="tt">{t.t}</div>
                     <div className="td">{t.d}</div>
@@ -239,7 +237,8 @@ export default function Dash({
             {POOLS.map(([k, p, sub]) => (
               <div className="mg" key={k}>
                 <Gauge pct={p} />
-                <div className="gn" style={{ color: PROVIDERS[k].color }}>
+                <div className="gn" style={{ color: PROVIDERS[k].color, display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                  <ProviderGlyphIcon provider={k} size={13} />
                   {PROVIDERS[k].name}
                 </div>
                 <div className="gs">{sub}</div>

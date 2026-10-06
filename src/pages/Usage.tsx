@@ -1,6 +1,7 @@
 /** 用量页：时间分段 + 汇总卡 + 趋势/构成/占比/Top/延迟/热力/聚合表（对应原型 #page-usage / renderUsage） */
 import { useState } from "react";
 import { Ic } from "../lib/icons";
+import { hasModelBrand, hasProviderGlyph, ModelBrandIcon, ProviderGlyphIcon } from "../lib/brand";
 import { DAYS7, DONUT, HEAT, LAT, MODEL_COLOR, PROVIDERS, TOK7, TOPACCT, USAGE_SETS } from "../lib/mock";
 import type { UsageRange } from "../lib/mock";
 import { fmt } from "../lib/fmt";
@@ -88,7 +89,11 @@ export default function Usage() {
           <span className="legend" style={{ margin: 0 }}>
             {Object.keys(set.models).map(k => (
               <span className="li" key={k}>
-                <i style={{ background: MODEL_COLOR[k] }}></i>
+                {hasModelBrand(k) ? (
+                  <ModelBrandIcon model={k} size={12} />
+                ) : (
+                  <i style={{ background: MODEL_COLOR[k] }}></i>
+                )}
                 {k}
               </span>
             ))}
@@ -128,7 +133,11 @@ export default function Usage() {
             <div className="legend" style={{ flexDirection: "column", alignItems: "flex-start", gap: 8, margin: 0 }}>
               {DONUT.map(d => (
                 <span className="li" key={d.k}>
-                  <i style={{ background: PROVIDERS[d.k].color }}></i>
+                  {hasProviderGlyph(d.k) ? (
+                    <ProviderGlyphIcon provider={d.k} size={12} />
+                  ) : (
+                    <i style={{ background: PROVIDERS[d.k].color }}></i>
+                  )}
                   {PROVIDERS[d.k].name} <b style={{ color: "var(--t2)" }}>{d.v}%</b>
                 </span>
               ))}

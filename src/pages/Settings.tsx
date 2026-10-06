@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { Ic } from "../lib/icons";
 import { toast } from "../lib/toast";
+import { ProviderBrandIcon } from "../lib/brand";
 
 export default function Settings() {
   const [autoStart, setAutoStart] = useState(false);
@@ -107,9 +108,7 @@ export default function Settings() {
                 <tr>
                   <td>
                     <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                      <i className="pv" style={{ width: 18, height: 18, fontSize: 9, borderRadius: 5, background: "#10b981" }}>
-                        G
-                      </i>
+                      <ProviderBrandIcon provider="gemini" size={18} />
                       gemini · 全部账号
                     </span>
                   </td>
@@ -125,9 +124,7 @@ export default function Settings() {
                 <tr>
                   <td>
                     <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                      <i className="pv" style={{ width: 18, height: 18, fontSize: 9, borderRadius: 5, background: "#0ea5e9" }}>
-                        C
-                      </i>
+                      <ProviderBrandIcon provider="codearts" size={18} />
                       codearts · 全部账号
                     </span>
                   </td>
@@ -207,7 +204,7 @@ export default function Settings() {
           <div className="kv">
             <span className="k">致谢</span>
             <span className="muted" style={{ fontSize: 12 }}>
-              Antigravity-Manager · zcode-pool · deepseek-harness · commandcode-proxy
+              Antigravity-Manager · zcode-pool · deepseek-harness · commandcode-proxy · 品牌图标 LobeHub Icons（MIT）
             </span>
           </div>
         </div>

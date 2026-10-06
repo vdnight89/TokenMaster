@@ -2,6 +2,7 @@
 import { fmtK } from "../lib/fmt";
 import { PROVIDERS } from "../lib/mock";
 import type { PvKey } from "../lib/mock";
+import { ProviderGlyphIcon, hasProviderGlyph } from "../lib/brand";
 
 export interface HbarItem {
   n: string;
@@ -18,7 +19,11 @@ export function Hbars({ data }: { data: readonly HbarItem[] }) {
         return (
           <div className="hbar" key={d.n}>
             <div className="nm">
-              <i style={{ background: c }}></i>
+              {hasProviderGlyph(d.pv) ? (
+                <ProviderGlyphIcon provider={d.pv} size={12} />
+              ) : (
+                <i style={{ background: c }}></i>
+              )}
               {d.n}
             </div>
             <div className="track">

@@ -2,6 +2,7 @@
 import { useState } from "react";
 import { Ic } from "../lib/icons";
 import { toast } from "../lib/toast";
+import { ProviderBrandIcon } from "../lib/brand";
 import type { ModalKind } from "../lib/ui";
 import { CoolTimer } from "../lib/ui";
 import { PROVIDERS, PV_KEYS, STATE_LAB } from "../lib/mock";
@@ -139,9 +140,7 @@ function AccCard({ a, onCi, onPw }: { a: Account; onCi: () => void; onPw: () => 
     <div className={"acc" + (a.cur ? " cur" : "") + (a.state === "cool" ? " cool" : "") + (a.state === "dead" ? " dead" : "")}>
       <div className="hd">
         <input type="checkbox" className="cbx" />
-        <div className="pv" style={{ background: pv.color }}>
-          {pv.name[0]}
-        </div>
+        <ProviderBrandIcon provider={a.pv} />
         <div className="grow" style={{ minWidth: 0 }}>
           <div className="nm" style={a.cur ? { color: "#7dabf8" } : undefined}>
             {a.name}

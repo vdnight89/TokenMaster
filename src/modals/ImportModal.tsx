@@ -1,6 +1,7 @@
 /** 模态：从 zcode-pool 导入（对应原型 #modal-import / openImport） */
 import { Ic } from "../lib/icons";
 import { toast } from "../lib/toast";
+import { ProviderBrandIcon } from "../lib/brand";
 import { IMPORT_LIST } from "../lib/mock";
 
 export default function ImportModal({ onClose }: { onClose: () => void }) {
@@ -30,6 +31,7 @@ export default function ImportModal({ onClose }: { onClose: () => void }) {
             {IMPORT_LIST.map(it => (
               <label className="kv" style={{ cursor: "pointer" }} key={it.n}>
                 <input type="checkbox" className="cbx" defaultChecked style={{ borderRadius: "50%" }} />
+                <ProviderBrandIcon provider="zcode" size={16} />
                 <span className="grow mono" style={{ fontSize: 12 }}>
                   {it.n}
                 </span>

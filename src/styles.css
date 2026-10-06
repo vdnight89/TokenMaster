@@ -299,6 +299,12 @@ body {
   font-size: 11px; font-weight: 800; color: #fff; letter-spacing: 0;
 }
 
+/* 品牌徽章容器（.pv 同形态；尺寸/底色由 brand.tsx 内联给出） */
+.pv-bi {
+  display: inline-flex; align-items: center; justify-content: center;
+  flex: none; line-height: 1;
+}
+
 /* ============ 表单 ============ */
 .inp {
   padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--r-sm);

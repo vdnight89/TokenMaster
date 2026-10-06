@@ -3,6 +3,7 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import { Ic } from "../lib/icons";
 import { CopyBtn } from "../lib/ui";
+import { ProviderBrandIcon } from "../lib/brand";
 import { MODEL_LIST, PROVIDERS, SETUPS } from "../lib/mock";
 import type { SetupTab } from "../lib/mock";
 
@@ -187,9 +188,7 @@ export default function Setup() {
                   </td>
                   <td>
                     <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: "11.5px" }}>
-                      <i className="pv" style={{ width: 18, height: 18, fontSize: 9, borderRadius: 5, background: PROVIDERS[m[1]].color }}>
-                        {PROVIDERS[m[1]].name[0]}
-                      </i>
+                      <ProviderBrandIcon provider={m[1]} size={18} />
                       <span style={{ color: "var(--t3)" }}>{PROVIDERS[m[1]].name}</span>
                     </span>
                   </td>
