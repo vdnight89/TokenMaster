@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1280">
+<title>TokenMaster · 总机台账</title>
+<script defer src="vendor/alpine.min.js"></script>
+<style>
+  :root{
+    --paper:#F5F1E8; --paper2:#EFE9DC; --paper3:#EAE3D2;
+    --ink:#1D1A16; --ink2:#5A5347; --line:#D9D2C2; --red:#B23A2E; --blue:#2C5F8A;
+    --mono:"Courier New","Consolas",monospace;
+    --serif:"Georgia","SimSun","宋体",serif;
+    --ui:"SimSun","宋体",serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--paper); color:var(--ink);
+    font:13px/1.6 var(--ui);
+    display:grid; grid-template-rows:64px 1fr; overflow:hidden;
+  }
+  /* ===== 台账簿头 ===== */
+  header{
+    display:flex; align-items:baseline; gap:18px; padding:14px 26px 10px;
+    border-bottom:3px double var(--ink); background:var(--paper);
+  }
+  header h1{font:700 21px/1 var(--serif); letter-spacing:.12em}
+  header h1 span{color:var(--red)}
+  .vol{font:12px var(--mono); color:var(--ink2)}
+  .hright{margin-left:auto; display:flex; gap:20px; align-items:baseline; font:12px var(--mono); color:var(--ink2)}
+  .hright .run b{color:var(--ink)}
+  .hright .key{border:1px solid var(--ink); padding:1px 8px; color:var(--ink); cursor:pointer}
+  .hright .key:hover{background:var(--ink); color:var(--paper)}
+  /* ===== 三段版式 ===== */
+  .cols{display:grid; grid-template-columns:196px 448px 1fr; min-height:0}
+  /* 目录 */
+  nav{border-right:1px solid var(--line); padding:18px 0 14px; background:var(--paper2); display:flex; flex-direction:column}
+  nav .cap{font:11px var(--mono); color:var(--ink2); letter-spacing:.3em; padding:0 22px 10px; border-bottom:1px solid var(--line); margin-bottom:8px}
+  nav button{
+    display:flex; gap:10px; width:100%; text-align:left; background:none; border:0;
+    font:14px var(--ui); color:var(--ink); padding:8px 22px; cursor:pointer; border-left:3px solid transparent;
+  }
+  nav button .no{font:11px var(--mono); color:var(--ink2); width:18px}
+  nav button:hover{background:var(--paper3)}
+  nav button.on{border-left:3px solid var(--red); background:var(--paper)}
+  nav .foot{margin-top:auto; font:10.5px var(--mono); color:var(--ink2); text-align:center; border-top:1px solid var(--line); padding-top:10px}
+  /* 待办队列 */
+  .queue{border-right:1px solid var(--line); display:flex; flex-direction:column; min-height:0}
+  .queue .qhead{
+    display:flex; align-items:baseline; gap:10px; padding:16px 22px 10px;
+    border-bottom:1px solid var(--line);
+  }
+  .queue .qhead h2{font:700 16px var(--serif); letter-spacing:.08em}
+  .queue .qhead .cnt{font:12px var(--mono); color:var(--red)}
+  .queue .qhead .filter{margin-left:auto; font:11px var(--mono); color:var(--ink2)}
+  .qlist{overflow-y:auto}
+  .qitem{
+    display:grid; grid-template-columns:64px minmax(0,1fr) auto; gap:4px 16px;
+    padding:12px 22px; border-bottom:1px solid var(--line); cursor:pointer;
+    border-left:3px solid transparent;
+  }
+  .qwhat{min-width:0; padding-right:4px}
+  .qitem:hover{background:var(--paper2)}
+  .qitem.on{border-left:3px solid var(--ink); background:var(--paper2); box-shadow:inset 0 0 0 1px var(--ink)}
+  .qno{font:12px var(--mono); color:var(--ink2)}
+  .qwhat b{font-weight:700}
+  .qwhat .sub{font:12px; color:var(--ink2)}
+  .qact{grid-column:2; font:12px var(--mono)}
+  .qact u{text-decoration-color:var(--red); cursor:pointer}
+  .qact u:hover{color:var(--red)}
+  .stamp{
+    justify-self:end; align-self:start;
+    font:700 10px/1 var(--mono); letter-spacing:.25em; color:var(--red);
+    border:1.5px solid var(--red); padding:4px 6px 3px 8px; transform:rotate(-4deg);
+    white-space:nowrap; border-radius:1px;
+  }
+  .stamp.ink{color:var(--ink); border-color:var(--ink)}
+  .stamp.blue{color:var(--blue); border-color:var(--blue)}
+  /* 登记卡 */
+  .detail{padding:22px 28px; overflow-y:auto; background:var(--paper)}
+  .detail .dhead{display:flex; align-items:baseline; gap:14px; border-bottom:1px solid var(--ink); padding-bottom:10px}
+  .detail .dhead h3{font:700 26px/1.2 var(--serif); letter-spacing:.04em}
+  .detail .dhead .dno{font:12px var(--mono); color:var(--ink2)}
+  .detail .dhead .dstamp{margin-left:auto}
+  .fields{margin:14px 0 6px}
+  .frow{display:flex; align-items:baseline; gap:8px; padding:7px 0; border-bottom:1px dotted var(--line); font-size:13px}
+  .frow .k{color:var(--ink2); letter-spacing:.15em; white-space:nowrap}
+  .frow .dots{flex:1; border-bottom:1px dotted var(--line); transform:translateY(-4px)}
+  .frow .v{font:12.5px var(--mono); text-align:right}
+  .frow .v.warn{color:var(--red); font-weight:700}
+  .frow .v.blue{color:var(--blue)}
+  .dops{display:flex; gap:10px; margin:16px 0 20px}
+  .btn{
+    font:13px var(--ui); letter-spacing:.2em; padding:7px 18px 7px 20px;
+    background:none; border:1.5px solid var(--ink); color:var(--ink); cursor:pointer;
+  }
+  .btn:hover{background:var(--ink); color:var(--paper)}
+  .btn.red{border-color:var(--red); color:var(--red)}
+  .btn.red:hover{background:var(--red); color:var(--paper)}
+  .calls h4{font:700 13px var(--serif); letter-spacing:.2em; border-bottom:1px solid var(--ink); padding-bottom:6px; margin-bottom:4px}
+  .call{display:grid; grid-template-columns:110px 130px 1fr 90px; gap:10px; font:11.5px var(--mono); color:var(--ink2); padding:6px 0; border-bottom:1px dotted var(--line)}
+  .call .t{color:var(--ink)}
+  .call .ok{color:var(--blue)}
+  .stampanim{animation:stampin .22s cubic-bezier(.2,1.4,.4,1)}
+  @keyframes stampin{0%{transform:rotate(-14deg) scale(1.7); opacity:0}100%{transform:rotate(-4deg) scale(1); opacity:1}}
+  .mark-done{display:inline-block; font:700 11px var(--mono); color:var(--red); border:1.5px solid var(--red); padding:3px 8px; transform:rotate(-4deg); letter-spacing:.2em; margin-left:10px}
+  .sign{margin-top:16px; font:11px var(--mono); color:var(--ink2); border-top:3px double var(--ink); padding-top:8px}
+</style>
+</head>
+<body x-data="{
+  st:new URLSearchParams(location.search).get('state')||'',
+  sel:0, stamped:false,
+  items:[
+    {no:'No.0847',obj:'workbuddy · wb-01',what:'token 将于 12 小时后过期',cls:''},
+    {no:'No.0846',obj:'lobsterai · lob-01',what:'48,000 积分 3 天后作废',cls:''},
+    {no:'No.0845',obj:'zcode · tm-03',what:'429 限流 · 冷却 04:32',cls:'ink'},
+    {no:'No.0844',obj:'minimax · mm-01',what:'今日未签到 · 可得 +5,000',cls:'blue'},
+    {no:'No.0843',obj:'zcode · 整池',what:'可领套餐 1 份 · 需过码',cls:''}
+  ]
+}" x-init="if(st==='stamp'){sel=3;stamped=true}">
+
+<header>
+  <h1>TOKENMASTER <span>总机台账</span></h1>
+  <span class="vol">第 3 卷 · 2026 年 10 月</span>
+  <div class="hright">
+    <span class="run">线路 <b>畅通</b> · 局号 <b>127.0.0.1:8317</b></span>
+    <span>今日接线 <b>1,247</b> 笔 · 2.31M tokens</span>
+    <button class="key">专线凭证 sk-tm-9f42···</button>
+  </div>
+</header>
+
+<div class="cols">
+  <nav>
+    <div class="cap">目 录</div>
+    <button><span class="no">01</span>总览·今日</button>
+    <button class="on"><span class="no">02</span>账号登记</button>
+    <button><span class="no">03</span>用量簿</button>
+    <button><span class="no">04</span>接线日志</button>
+    <button><span class="no">05</span>局内设置</button>
+    <div class="foot">— 卷末附接入说明 —</div>
+  </nav>
+
+  <section class="queue">
+    <div class="qhead">
+      <h2>今日待办</h2><span class="cnt">5 件</span>
+      <span class="filter">按急迫排序</span>
+    </div>
+    <div class="qlist">
+      <template x-for="(it,i) in items" :key="it.no">
+        <div class="qitem" :class="sel===i?'on':''" @click="sel=i">
+          <span class="qno" x-text="it.no"></span>
+          <div class="qwhat"><b x-text="it.obj"></b><div class="sub" x-text="it.what"></div></div>
+          <span class="stamp" :class="it.cls" x-text="['将过期','临期','限流','待签','可领'][i]"></span>
+          <div class="qact"><u x-text="['重新登录','优先消耗','等待自动恢复',stamped&&i===3?'已签收':'签到','领取'][i]"></u></div>
+        </div>
+      </template>
+    </div>
+  </section>
+
+  <section class="detail">
+    <!-- 0 workbuddy -->
+    <div x-show="sel===0">
+      <div class="dhead"><h3>workbuddy · wb-01</h3><span class="dno">登记 No.0847 · 腾讯国际版</span><span class="stamp">将过期</span></div>
+      <div class="fields">
+        <div class="frow"><span class="k">凭据种类</span><span class="dots"></span><span class="v">external-link token</span></div>
+        <div class="frow"><span class="k">接入方式</span><span class="dots"></span><span class="v">浏览器授权 · 轮询换发</span></div>
+        <div class="frow"><span class="k">剩余额度</span><span class="dots"></span><span class="v">620K / 2.00M tokens</span></div>
+        <div class="frow"><span class="k">凭据时效</span><span class="dots"></span><span class="v warn">12 小时后过期</span></div>
+        <div class="frow"><span class="k">上游线路</span><span class="dots"></span><span class="v">www.workbuddy.ai</span></div>
+      </div>
+      <div class="dops"><button class="btn red">重新登录</button><button class="btn">暂时停用</button><button class="btn">登记详情</button></div>
+      <div class="calls"><h4>近 话 务</h4>
+        <div class="call"><span class="t">21:02:14</span><span>claude-sonnet-4-5</span><span>出 3,182 tokens</span><span class="ok">接线完成</span></div>
+        <div class="call"><span class="t">20:47:51</span><span>claude-sonnet-4-5</span><span>出 5,904 tokens</span><span class="ok">接线完成</span></div>
+        <div class="call"><span class="t">20:31:26</span><span>claude-sonnet-4-5</span><span>出 2,041 tokens</span><span class="ok">接线完成</span></div>
+        <div class="call"><span class="t">20:12:09</span><span>claude-sonnet-4-5</span><span>—</span><span>转接 zcode/reg-04</span></div>
+        <div class="call"><span class="t">19:58:40</span><span>claude-sonnet-4-5</span><span>出 7,730 tokens</span><span class="ok">接线完成</span></div>
+        <div class="call"><span class="t">19:31:02</span><span>claude-sonnet-4-5</span><span>出 1,864 tokens</span><span class="ok">接线完成</span></div>
+      </div>
+      <div class="sign">※ 本卡登记于 2026-10-06 21:04 · 值班：TokenMaster · 第 3 卷 第 847 号</div>
+    </div>
+    <!-- 1 lobsterai -->
+    <div x-show="sel===1" style="display:none">
+      <div class="dhead"><h3>lobsterai · lob-01</h3><span class="dno">登记 No.0846 · 有道龙虾</span><span class="stamp">临期</span></div>
+      <div class="fields">
+        <div class="frow"><span class="k">凭据种类</span><span class="dots"></span><span class="v">authCode 换发 token</span></div>
+        <div class="frow"><span class="k">剩余积分</span><span class="dots"></span><span class="v warn">48,000 · 3 天后作废</span></div>
+        <div class="frow"><span class="k">今日消耗</span><span class="dots"></span><span class="v">6,410 积分</span></div>
+        <div class="frow"><span class="k">建议</span><span class="dots"></span><span class="v blue">置顶消耗 · 临期优先</span></div>
+      </div>
+      <div class="dops"><button class="btn red">设为优先消耗</button><button class="btn">用量簿</button></div>
+    </div>
+    <!-- 2 tm-03 -->
+    <div x-show="sel===2" style="display:none">
+      <div class="dhead"><h3>zcode · tm-03</h3><span class="dno">登记 No.0845 · 智谱 TRIAL</span><span class="stamp ink">限流</span></div>
+      <div class="fields">
+        <div class="frow"><span class="k">事由</span><span class="dots"></span><span class="v warn">上游 429 · RETRY-AFTER 272s</span></div>
+        <div class="frow"><span class="k">冷却解除</span><span class="dots"></span><span class="v">21:04（04:32 后）</span></div>
+        <div class="frow"><span class="k">影响模型</span><span class="dots"></span><span class="v">glm-4.7 / glm-4.6</span></div>
+        <div class="frow"><span class="k">池内承接</span><span class="dots"></span><span class="v blue">其余 4 回路照常</span></div>
+      </div>
+      <div class="dops"><button class="btn red">立即重试</button><button class="btn">跳过此号</button><button class="btn">复制诊断</button></div>
+    </div>
+    <!-- 3 minimax 签到 -->
+    <div x-show="sel===3" style="display:none">
+      <div class="dhead"><h3>minimax · mm-01</h3><span class="dno">登记 No.0844 · MiniMax Code</span>
+        <span class="stamp blue" x-show="!stamped">待签</span>
+        <span class="stamp stampanim" x-show="stamped" style="color:var(--red);border-color:var(--red)">已签收</span>
+      </div>
+      <div class="fields">
+        <div class="frow"><span class="k">凭据种类</span><span class="dots"></span><span class="v">设备码 OAuth · PKCE</span></div>
+        <div class="frow"><span class="k">今日签到</span><span class="dots"></span><span class="v" :class="stamped?'warn':''" x-text="stamped?'已签 · +5,000 积分':'未签 · 可得 +5,000'"></span></div>
+        <div class="frow"><span class="k">连续签到</span><span class="dots"></span><span class="v">14 天</span></div>
+        <div class="frow"><span class="k">剩余额度</span><span class="dots"></span><span class="v">612K / 1.00M tokens</span></div>
+      </div>
+      <div class="dops">
+        <button class="btn red" x-show="!stamped" @click="stamped=true">签 到</button>
+        <span class="mark-done stampanim" x-show="stamped">签讫 · No.0844</span>
+        <button class="btn">登记详情</button>
+      </div>
+    </div>
+    <!-- 4 zcode 套餐 -->
+    <div x-show="sel===4" style="display:none">
+      <div class="dhead"><h3>zcode · 整池</h3><span class="dno">登记 No.0843 · 智谱 · 5 回路</span><span class="stamp">可领</span></div>
+      <div class="fields">
+        <div class="frow"><span class="k">可领套餐</span><span class="dots"></span><span class="v">1 份 · Lite 周期包</span></div>
+        <div class="frow"><span class="k">领取条件</span><span class="dots"></span><span class="v">需通过上游验证码（自动过码）</span></div>
+        <div class="frow"><span class="k">池深合计</span><span class="dots"></span><span class="v">3.40M tokens</span></div>
+      </div>
+      <div class="dops"><button class="btn red">领 取</button><button class="btn">预览套餐</button></div>
+    </div>
+  </section>
+</div>
+</body>
+</html>
