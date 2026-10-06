@@ -20,13 +20,20 @@ use crate::route::Route;
 pub const MAX_ATTEMPTS: usize = 4;
 const DEFAULT_RATE_LIMIT_SECS: u64 = 60;
 
+/// 编排成功结果：补全内容 + 实际服务的账号（账本归因用）。
+#[derive(Debug)]
+pub struct Dispatched {
+    pub completion: ChatCompletion,
+    pub account_id: String,
+}
+
 /// 非流式：带换号重试的补全（route 由调用方解析，便于沿用映射表）。
 pub async fn complete_with_retry(
     pool: &Arc<Mutex<TokenPool>>,
     provider: &dyn Provider,
     route: &Route,
     req: &ChatRequest,
-) -> Result<ChatCompletion, ApiError> {
+) -> Result<Dispatched, ApiError> {
     let model = route.model.clone();
     let mut tried: HashSet<String> = HashSet::new();
     let mut last_err: Option<ProviderError> = None;
@@ -53,7 +60,7 @@ pub async fn complete_with_retry(
         let cred = Credential { account_id: account_id.clone(), secret };
         tried.insert(account_id.clone());
         match provider.complete(&cred, route, req).await {
-            Ok(c) => return Ok(c),
+            Ok(completion) => return Ok(Dispatched { completion, account_id }),
             Err(ProviderError::BadRequest(_)) => {
                 return Err(ApiError::Message("request rejected by upstream".into()));
             }

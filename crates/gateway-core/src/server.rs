@@ -30,6 +30,8 @@ pub struct AppState {
     pub providers: HashMap<String, Arc<dyn Provider>>,
     /// 每 Provider 一张令牌池；未配置的 Provider 走无池直连。
     pub pools: HashMap<String, Arc<std::sync::Mutex<crate::pool::TokenPool>>>,
+    /// 用量账本（未配置则不记账）。
+    pub ledger: Option<Arc<crate::ledger::Ledger>>,
 }
 
 pub struct GatewayHandle {
@@ -73,12 +75,22 @@ pub async fn start_full(
     providers: Vec<Arc<dyn Provider>>,
     pools: HashMap<String, Arc<std::sync::Mutex<crate::pool::TokenPool>>>,
 ) -> std::io::Result<GatewayHandle> {
+    start_with_ledger(config, providers, pools, None).await
+}
+
+/// 启动网关并挂账本（缝 1 记账行为的测试入口）。
+pub async fn start_with_ledger(
+    config: GatewayConfig,
+    providers: Vec<Arc<dyn Provider>>,
+    pools: HashMap<String, Arc<std::sync::Mutex<crate::pool::TokenPool>>>,
+    ledger: Option<Arc<crate::ledger::Ledger>>,
+) -> std::io::Result<GatewayHandle> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
     let providers: HashMap<String, Arc<dyn Provider>> =
         providers.into_iter().map(|p| (p.id().to_string(), p)).collect();
-    let state = AppState { config, providers, pools };
+    let state = AppState { config, providers, pools, ledger };
     let app = router(state);
     tokio::spawn(async move {
         let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -121,17 +133,76 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({ "object": "list", "data": data }))
 }
 
+/// 路由解析失败时仍要记账：用请求原文构造一个伪路由（provider 取前缀或 unknown）。
+fn fake_route(model: &str) -> crate::route::Route {
+    match model.split_once('/') {
+        Some((p, m)) if !p.is_empty() && !m.is_empty() => {
+            crate::route::Route { provider: p.to_string(), model: m.to_string() }
+        }
+        _ => crate::route::Route { provider: "unknown".into(), model: model.to_string() },
+    }
+}
+
+/// 记账：成功与失败都记（spec 用户故事 23）。
+fn record_usage(
+    state: &AppState,
+    route: &crate::route::Route,
+    account_id: &str,
+    status: u16,
+    usage: Option<&crate::openai::Usage>,
+    proto: &'static str,
+    started: std::time::Instant,
+) {
+    let Some(ledger) = state.ledger.clone() else { return };
+    let (p, c) = usage.map(|u| (u.prompt_tokens, u.completion_tokens)).unwrap_or((0, 0));
+    ledger.record(crate::ledger::UsageRecord {
+        ts: crate::openai::now_ts(),
+        provider: route.provider.clone(),
+        account_id: account_id.to_string(),
+        model: route.model.clone(),
+        prompt_tokens: p,
+        completion_tokens: c,
+        status,
+        ttfb_ms: None,
+        duration_ms: started.elapsed().as_millis() as u64,
+        proto,
+    });
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let started = std::time::Instant::now();
     let Json(req) = payload.map_err(|_| ApiError::Message("invalid or missing JSON body".into()))?;
-    let route = resolve_model(&req.model, &state.config.model_map)?;
-    let provider = state.providers.get(&route.provider).ok_or(ApiError::ModelNotFound)?.clone();
+    let route = match resolve_model(&req.model, &state.config.model_map) {
+        Ok(r) => r,
+        Err(e) => {
+            record_usage(&state, &fake_route(&req.model), "n/a", crate::error::status_u16(&e), None, "openai", started);
+            return Err(e);
+        }
+    };
+    let provider = match state.providers.get(&route.provider) {
+        Some(p) => p.clone(),
+        None => {
+            let e = ApiError::ModelNotFound;
+            record_usage(&state, &route, "n/a", crate::error::status_u16(&e), None, "openai", started);
+            return Err(e);
+        }
+    };
     if let Some(pool) = state.pools.get(&route.provider) {
-        let completion =
-            crate::orchestrate::complete_with_retry(pool, provider.as_ref(), &route, &req).await?;
-        return Ok(Json(serde_json::to_value(completion).expect("completion serializes")).into_response());
+        let dispatched =
+            match crate::orchestrate::complete_with_retry(pool, provider.as_ref(), &route, &req).await {
+                Ok(d) => {
+                    record_usage(&state, &route, &d.account_id, 200, Some(&d.completion.usage), "openai", started);
+                    d
+                }
+                Err(e) => {
+                    record_usage(&state, &route, "n/a", crate::error::status_u16(&e), None, "openai", started);
+                    return Err(e);
+                }
+            };
+        return Ok(Json(serde_json::to_value(dispatched.completion).expect("completion serializes")).into_response());
     }
     if req.stream {
         let chunk_stream = provider
@@ -145,6 +216,7 @@ async fn chat_completions(
             .complete(&Credential::direct(), &route, &req)
             .await
             .map_err(provider_error)?;
+        record_usage(&state, &route, "direct", 200, Some(&completion.usage), "openai", started);
         Ok(Json(serde_json::to_value(completion).expect("completion serializes")).into_response())
     }
 }

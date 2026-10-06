@@ -71,6 +71,11 @@ pub fn error_json(e: &ApiError) -> Value {
     json!({ "error": { "message": message, "type": "invalid_request_error", "code": code } })
 }
 
+/// 对外 HTTP 状态码（账本记录用）。
+pub fn status_u16(e: &ApiError) -> u16 {
+    e.fields().0.as_u16()
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = self.fields();

@@ -81,7 +81,8 @@ async fn rate_limited_account_is_cooled_and_next_account_serves() {
     ]));
     let pool = pool_of(&["a", "b"]);
     let out = orchestrate::complete_with_retry(&pool, &provider, &route(), &req()).await.unwrap();
-    assert_eq!(out.choices[0].message.content, "来自 b 的回答");
+    assert_eq!(out.completion.choices[0].message.content, "来自 b 的回答");
+    assert_eq!(out.account_id, "b", "归因到实际服务的账号");
     assert_eq!(provider.calls(), 2);
     let p = pool.lock().unwrap();
     assert!(p.entries().iter().find(|e| e.account_id == "a").unwrap()
@@ -96,7 +97,7 @@ async fn credential_error_marks_dead_and_switches() {
     ]));
     let pool = pool_of(&["a", "b"]);
     let out = orchestrate::complete_with_retry(&pool, &provider, &route(), &req()).await.unwrap();
-    assert_eq!(out.choices[0].message.content, "ok-b");
+    assert_eq!(out.completion.choices[0].message.content, "ok-b");
     let p = pool.lock().unwrap();
     assert!(p.entries().iter().find(|e| e.account_id == "a").unwrap().dead);
 }

@@ -8,6 +8,7 @@ pub mod consume;
 pub mod crypto;
 pub mod error;
 pub mod key;
+pub mod ledger;
 pub mod mock;
 pub mod openai;
 pub mod orchestrate;

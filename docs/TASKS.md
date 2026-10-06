@@ -40,8 +40,8 @@
 
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
-| T3.1 | 账本：内存流水 + JSONL 滚动落盘（32MB .old） | 1 | todo | T1.5 |
-| T3.2 | 聚合查询：按天/Provider/账号/模型（供 GUI 的 IPC 用） | 1 | todo | T3.1 |
+| T3.1 | 账本：内存流水 + JSONL 滚动落盘（32MB .old） | 1 | done | T1.5 |
+| T3.2 | 聚合查询：按天/Provider/账号/模型（供 GUI 的 IPC 用） | 1 | done | T3.1 |
 
 ## M4 Provider 适配器（缝 2：stub 上游回放，默认跳过真实 e2e）
 
