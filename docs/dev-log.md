@@ -19,3 +19,4 @@
 - 2026-10-07 T2.5 TDD：刷新调度（续期不看 enabled/不可续期只探测/失败标失效）3 测。
 - 2026-10-07 M2 集成关卡：workspace 52 测全绿 + clippy 0 警告 + pnpm build 绿。另：应用户要求处理 mimosa 拦截——round-02 原型源码（已 100% 移植）归档为 prototype.zip 并移除散文件，消除提交扫描的持续误报源；宿主级 mimosa 开关需在 ZCode 插件设置里禁用。
 - 2026-10-07 T3.1+T3.2 TDD：账本（JSONL 字段/单代 .old 滚动/坏路径不 panic/四维聚合/500 环）5 测 + 缝 1 记账（成功/失败都入账、账号归因、路由失败也入账；orchestrate 返回 Dispatched{completion,account_id}）1 测。M3 关卡：16 套件 58 测全绿 + clippy 0。提交 74c9814。
+- 2026-10-07 用户新增需求 T5.12：Provider/模型品牌图标（@lobehub/icons 优先 + 字母徽章兜底），已插入 M5 任务板（纯前端，可与 M4 并行）。
