@@ -38,6 +38,7 @@ fn body(model: &str) -> serde_json::Value {
 async fn successful_and_failed_requests_are_ledgered_with_account_attribution() {
     let ledger = Arc::new(Ledger::memory());
     let cfg = GatewayConfig {
+        port: None,
         auth: AuthMode::Disabled,
         model_map: Vec::new(),
         registry: Registry::with(ProviderCatalog { id: "mock".into(), models: vec![ModelInfo { id: "mock-alpha".into() }] }),

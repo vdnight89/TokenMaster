@@ -157,6 +157,7 @@ async fn gateway_serves_from_next_account_after_429() {
         ("b", Ok("端到端来自 b")),
     ])));
     let cfg = GatewayConfig {
+        port: None,
         auth: AuthMode::Disabled,
         model_map: Vec::new(),
         registry: Registry::with(ProviderCatalog { id: "mock".into(), models: vec![ModelInfo { id: "mock-alpha".into() }] }),

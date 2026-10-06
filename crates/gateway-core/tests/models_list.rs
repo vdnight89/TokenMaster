@@ -6,6 +6,7 @@ use gateway_core::registry::{ModelInfo, ProviderCatalog, Registry};
 
 fn config_with_mock() -> GatewayConfig {
     GatewayConfig {
+        port: None,
         auth: AuthMode::Disabled,
         model_map: Vec::new(),
         registry: Registry::with(ProviderCatalog {

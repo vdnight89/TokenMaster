@@ -40,6 +40,7 @@ impl Provider for Scripted {
 
 async fn sse_of(pieces: Vec<String>) -> (String, String) {
     let c = GatewayConfig {
+        port: None,
         auth: AuthMode::Disabled,
         model_map: vec![],
         registry: Registry::with(ProviderCatalog { id: "mock".into(), models: vec![ModelInfo { id: "mock-alpha".into() }] }),
@@ -93,6 +94,7 @@ async fn content_without_think_tags_passes_through_unchanged() {
 async fn reasoning_chunks_from_provider_pass_through_untouched() {
     // Provider 已给出 Reasoning 增量（上游有独立思考字段时），消费层不得二次处理
     let c = GatewayConfig {
+        port: None,
         auth: AuthMode::Disabled,
         model_map: vec![],
         registry: Registry::with(ProviderCatalog { id: "mock".into(), models: vec![ModelInfo { id: "mock-alpha".into() }] }),

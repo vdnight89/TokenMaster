@@ -50,7 +50,7 @@
 
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
-| T4.1 | zcode：双通道(anthropic)、CLI 设备码登录、伪装头、3007→验证码事件、套餐领取、积分/额度 | 2 | doing(T4.1a 非流式done) | M1, M2 |
+| T4.1 | zcode：双通道(anthropic)、CLI 设备码登录、伪装头、3007→验证码事件、套餐领取、积分/额度 | 2 | doing(T4.1a/b 推理双模式done；登录/领取/额度待续) | M1, M2 |
 | T4.2 | gemini：CloudCode 上游、OAuth 回调、双层信封、thoughtSignature、Antigravity 身份 | 2 | todo | M1, M2 |
 | T4.3 | commandcode：私有信封、每 key 设备指纹(HMAC)、SSE 转译、user_ key 透传 | 2 | todo | M1, M2 |
 | T4.4 | trae：SOLO 载荷/SSE、本地回调 18080、Cloud-IDE-JWT | 2 | todo | M1, M2 |
@@ -87,6 +87,7 @@
 
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
+| T6.0 | 【用户指定优先】无边框窗口 + 自定义标题栏：`decorations:false` 去掉 Windows 原生标题栏；用 round-02 原型 topbar 的 traffic 三点（红关/黄最小化/绿最大化，hover 显示图标）作为窗控，顶栏整体设为拖拽区（data-tauri-drag-region）、双击切换最大化；保留右侧网关状态芯片与版本号不受拖拽影响；关闭行为遵循"关窗最小化到托盘"设置（T6.1 联动）；截图自查与原型对照 | — | todo | T0.3 |
 | T6.1 | 托盘（菜单/tooltip）+ 单实例 + 开机自启 + 关窗最小化 | — | todo | T0.3 |
 | T6.2 | zcode-pool 导入实现（enc:v1 兼容解析，读其账号目录） | 2 | todo | T2.1, T4.1 |
 | T6.3 | 验证码载体：WebView 子窗口按需拉起 + 供应池退避 | 2 | todo | T0.3, T4.1 |

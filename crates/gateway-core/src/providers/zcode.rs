@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::anthropic::{completion_from_anthropic, openai_to_anthropic_body};
 use crate::openai::{ChatCompletion, ChatRequest};
-use crate::provider::{ChunkStream, Credential, Provider, ProviderError};
+use crate::provider::{ChunkStream, Credential, Provider, ProviderError, StreamChunk};
 use crate::registry::{ModelInfo, ProviderCatalog};
 use crate::route::Route;
 
@@ -98,34 +98,111 @@ impl ZcodeProvider {
             .send()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let status = resp.status();
-        if status.as_u16() == 200 {
+        if resp.status().as_u16() == 200 {
             let v: Value = resp.json().await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
             return completion_from_anthropic(&route.composite(), &v)
                 .map_err(ProviderError::Upstream);
         }
-        let retry_after = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        let text = resp.text().await.unwrap_or_default();
-        match status.as_u16() {
-            401 => Err(ProviderError::Credential(format!("401 jwt rejected: {}", truncate(&text)))),
-            429 => Err(ProviderError::RateLimited {
-                retry_after_secs: Some(retry_after.unwrap_or(60)),
-                msg: truncate(&text),
-            }),
-            // 3012：官方以 405 + code 3012 表达身份块准入失败（dsh 实测）
-            405 if text.contains("3012") => Err(ProviderError::RateLimited {
-                retry_after_secs: Some(IDENTITY_COOLDOWN_SECS),
-                msg: format!("identity block rejected (3012): {}", truncate(&text)),
-            }),
-            400 if text.contains("3007") => Err(ProviderError::RateLimited {
-                retry_after_secs: Some(60),
-                msg: "captcha required (3007)".into(),
-            }),
-            code => Err(ProviderError::Upstream(format!("http {code}: {}", truncate(&text)))),
+        Err(map_upstream_error(resp).await)
+    }
+}
+
+/// 非即改即用的错误响应 → ProviderError（complete 与 stream 共用）。
+async fn map_upstream_error(resp: reqwest::Response) -> ProviderError {
+    let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let text = resp.text().await.unwrap_or_default();
+    match status {
+        401 => ProviderError::Credential(format!("401 jwt rejected: {}", truncate(&text))),
+        429 => ProviderError::RateLimited {
+            retry_after_secs: Some(retry_after.unwrap_or(60)),
+            msg: truncate(&text),
+        },
+        // 3012：官方以 405 + code 3012 表达身份块准入失败（dsh 实测）
+        405 if text.contains("3012") => ProviderError::RateLimited {
+            retry_after_secs: Some(IDENTITY_COOLDOWN_SECS),
+            msg: format!("identity block rejected (3012): {}", truncate(&text)),
+        },
+        400 if text.contains("3007") => ProviderError::RateLimited {
+            retry_after_secs: Some(60),
+            msg: "captcha required (3007)".into(),
+        },
+        code => ProviderError::Upstream(format!("http {code}: {}", truncate(&text))),
+    }
+}
+
+/// Anthropic stop_reason → OpenAI finish_reason。
+fn map_stop_reason(r: &str) -> String {
+    match r {
+        "max_tokens" => "length".into(),
+        "tool_use" => "tool_calls".into(),
+        _ => "stop".into(),
+    }
+}
+
+type ByteChunkStream = futures::stream::BoxStream<'static, Result<Vec<u8>, reqwest::Error>>;
+
+/// zcode 流式状态机：上游 Anthropic SSE 事件 → StreamChunk。
+struct ZcodeStreamState {
+    bytes: ByteChunkStream,
+    parser: crate::sse::SseParser,
+    input_tokens: u64,
+    output_tokens: u64,
+    stop_reason: String,
+    queue: std::collections::VecDeque<Result<StreamChunk, ProviderError>>,
+    role_sent: bool,
+    done: bool,
+}
+
+impl ZcodeStreamState {
+    fn on_event(&mut self, data: &str) {
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            return; // 忽略无法解析的载荷（如 ping）
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                self.input_tokens = v["message"]["usage"]["input_tokens"].as_u64().unwrap_or(0);
+                if !self.role_sent {
+                    self.role_sent = true;
+                    self.queue.push_back(Ok(StreamChunk::Role));
+                }
+            }
+            Some("content_block_delta") => {
+                let delta = &v["delta"];
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(t) = delta.get("text").and_then(Value::as_str) {
+                            self.queue.push_back(Ok(StreamChunk::Content(t.to_string())));
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(t) = delta.get("thinking").and_then(Value::as_str) {
+                            self.queue.push_back(Ok(StreamChunk::Reasoning(t.to_string())));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("message_delta") => {
+                if let Some(stop) = v["delta"]["stop_reason"].as_str() {
+                    self.stop_reason = map_stop_reason(stop);
+                }
+                if let Some(out) = v["usage"]["output_tokens"].as_u64() {
+                    self.output_tokens = out;
+                }
+            }
+            Some("message_stop") => {
+                let usage = crate::openai::Usage::sum(self.input_tokens, self.output_tokens);
+                self.queue.push_back(Ok(StreamChunk::Finish {
+                    reason: self.stop_reason.clone(),
+                    usage,
+                }));
+            }
+            _ => {}
         }
     }
 }
@@ -155,8 +232,71 @@ impl Provider for ZcodeProvider {
         self.post_messages(cred, route, req).await
     }
 
-    async fn stream(&self, _cred: &Credential, _route: &Route, _req: &ChatRequest) -> Result<ChunkStream, ProviderError> {
-        // T4.1b：上游 SSE（anthropic 事件流）→ StreamChunk 转换
-        Err(ProviderError::Upstream("zcode streaming arrives in T4.1b".into()))
+    async fn stream(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChunkStream, ProviderError> {
+        let mut upstream_req = req.clone();
+        upstream_req.model = route.model.clone();
+        upstream_req.stream = true;
+        let body = openai_to_anthropic_body(&upstream_req, self.system_prefix.as_deref());
+        let resp = self
+            .client
+            .post(format!("{}{}", self.base, MESSAGES_PATH))
+            .headers(self.identity_headers(cred))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        if resp.status().as_u16() != 200 {
+            return Err(map_upstream_error(resp).await);
+        }
+        let bytes: ByteChunkStream = {
+            use futures::StreamExt;
+            resp.bytes_stream().map(|r| r.map(|b| b.to_vec())).boxed()
+        };
+        let state = ZcodeStreamState {
+            bytes,
+            parser: crate::sse::SseParser::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            stop_reason: "stop".into(),
+            queue: std::collections::VecDeque::new(),
+            role_sent: false,
+            done: false,
+        };
+        let stream = futures::stream::unfold(state, |mut st| async move {
+            use futures::StreamExt;
+            loop {
+                if let Some(item) = st.queue.pop_front() {
+                    return Some((item, st));
+                }
+                if st.done {
+                    return None;
+                }
+                match st.bytes.next().await {
+                    Some(Ok(chunk)) => {
+                        st.parser.feed(&chunk);
+                        while let Some(data) = st.parser.next_data() {
+                            st.on_event(&data);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        st.done = true;
+                        return Some((Err(ProviderError::Upstream(e.to_string())), st));
+                    }
+                    None => {
+                        // 上游结束；没有 message_stop 就不伪造 Finish（截断保持诚实）
+                        st.done = true;
+                        st.parser.finalize();
+                        while let Some(data) = st.parser.next_data() {
+                            st.on_event(&data);
+                        }
+                        if let Some(item) = st.queue.pop_front() {
+                            return Some((item, st));
+                        }
+                        return None;
+                    }
+                }
+            }
+        });
+        Ok(Box::pin(stream))
     }
 }

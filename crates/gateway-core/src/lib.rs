@@ -19,6 +19,7 @@ pub mod refresh;
 pub mod registry;
 pub mod route;
 pub mod server;
+pub mod sse;
 pub mod store;
 
 pub use provider::Credential;

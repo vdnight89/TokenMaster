@@ -197,6 +197,9 @@ pub fn openai_to_anthropic_body(req: &ChatRequest, system_prefix: Option<&str>) 
     if let Some(temp) = req.raw.get("temperature") {
         body["temperature"] = temp.clone();
     }
+    if req.stream {
+        body["stream"] = json!(true);
+    }
     body
 }
 

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 async fn spawn(auth: AuthMode) -> gateway_core::server::GatewayHandle {
     let c = GatewayConfig {
+        port: None,
         auth,
         model_map: vec![],
         registry: Registry::with(ProviderCatalog { id: "mock".into(), models: vec![ModelInfo { id: "mock-alpha".into() }] }),

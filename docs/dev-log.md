@@ -22,3 +22,5 @@
 - 2026-10-07 用户新增需求 T5.12：Provider/模型品牌图标（@lobehub/icons 优先 + 字母徽章兜底），已插入 M5 任务板（纯前端，可与 M4 并行）。
 - 2026-10-07 T0.3 Tauri 壳：cargo build 绿；WebView2 已在非标准路径 C:/Program Files (x86)/Microsoft/EdgeWebView（注册表确认 136.0.3240.92，标准路径检查会漏报）；网关端口配置化（桌面壳固定 8787 与原型一致）；运行时冒烟通过（tauri dev：8787→401 鉴权活着、5173→200 前端加载）。图标：stdlib 生成 1024 PNG → tauri icon 全套。
 - 2026-10-07 T4.1a zcode Provider 首切片：start-plan 通道非流式（Anthropic 协议出站转换 openai_to_anthropic_body/completion_from_anthropic；身份头 11 项对照 reference；401→Credential/429→Retry-After/3012→30min 冷却/3007→限流）stub 4 测绿。全仓 62 测/clippy 0。
+- 2026-10-07 T4.1b zcode 流式：SSE 事件流→StreamChunk（message_start 取 input/发 Role、text_delta/thinking_delta、message_delta 取 stop/输出量、message_stop 收 Finish；无 message_stop 不伪造完成）；新增共享 sse.rs 增量解析器（跨 chunk/CRLF/多行 data，含 3 单测）；body 构造器补 stream 标志；错误映射抽 map_upstream_error 复用。顺手修复 T0.3 引入 GatewayConfig.port 后 7 个旧测试字面量漏改的编译错。全仓 68 测绿/clippy 0。
+- 2026-10-07 用户新增需求 T6.0【优先】：无边框窗口 + 自定义标题栏（traffic 三点窗控 + 拖拽区），去掉 Windows 原生标题栏。
