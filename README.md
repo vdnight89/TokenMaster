@@ -40,7 +40,9 @@ Tauri 2（Rust：axum + reqwest + tokio）+ React 19 + antd + vite。
 ## 仓库结构
 
 ```
-CONTEXT.md          # 领域术语表（glossary）
-docs/adr/           # 架构决策记录
-LICENSE             # 许可声明
+CONTEXT.md            # 领域术语表（glossary）
+docs/adr/             # 架构决策记录（0001~0007）
+docs/spec/v1.md       # v1 实施规格说明（ready-for-agent）
+docs/reference/       # 参考项目解读手册（code graph + 复用映射）
+LICENSE               # 许可声明
 ```
