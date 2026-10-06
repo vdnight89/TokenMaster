@@ -5,6 +5,8 @@ use crate::registry::Registry;
 
 #[derive(Clone, Debug, Default)]
 pub struct GatewayConfig {
+    /// 监听端口；None = 随机端口（测试用）。
+    pub port: Option<u16>,
     /// 网关密钥鉴权模式。
     pub auth: AuthMode,
     /// 模型名路由表（裸模型名 → "provider/model"，按优先级排序）。

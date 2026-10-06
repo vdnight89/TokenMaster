@@ -1,0 +1,19 @@
+[package]
+name = "tokenmaster"
+version.workspace = true
+edition.workspace = true
+description = "TokenMaster 桌面壳（Tauri 2）：内嵌 gateway-core 网关（ADR-0004）"
+build = "build.rs"
+
+[lib]
+name = "tokenmaster_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gateway-core = { path = "../crates/gateway-core" }

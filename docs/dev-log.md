@@ -20,3 +20,5 @@
 - 2026-10-07 M2 集成关卡：workspace 52 测全绿 + clippy 0 警告 + pnpm build 绿。另：应用户要求处理 mimosa 拦截——round-02 原型源码（已 100% 移植）归档为 prototype.zip 并移除散文件，消除提交扫描的持续误报源；宿主级 mimosa 开关需在 ZCode 插件设置里禁用。
 - 2026-10-07 T3.1+T3.2 TDD：账本（JSONL 字段/单代 .old 滚动/坏路径不 panic/四维聚合/500 环）5 测 + 缝 1 记账（成功/失败都入账、账号归因、路由失败也入账；orchestrate 返回 Dispatched{completion,account_id}）1 测。M3 关卡：16 套件 58 测全绿 + clippy 0。提交 74c9814。
 - 2026-10-07 用户新增需求 T5.12：Provider/模型品牌图标（@lobehub/icons 优先 + 字母徽章兜底），已插入 M5 任务板（纯前端，可与 M4 并行）。
+- 2026-10-07 T0.3 Tauri 壳：cargo build 绿；WebView2 已在非标准路径 C:/Program Files (x86)/Microsoft/EdgeWebView（注册表确认 136.0.3240.92，标准路径检查会漏报）；网关端口配置化（桌面壳固定 8787 与原型一致）；运行时冒烟通过（tauri dev：8787→401 鉴权活着、5173→200 前端加载）。图标：stdlib 生成 1024 PNG → tauri icon 全套。
+- 2026-10-07 T4.1a zcode Provider 首切片：start-plan 通道非流式（Anthropic 协议出站转换 openai_to_anthropic_body/completion_from_anthropic；身份头 11 项对照 reference；401→Credential/429→Retry-After/3012→30min 冷却/3007→限流）stub 4 测绿。全仓 62 测/clippy 0。

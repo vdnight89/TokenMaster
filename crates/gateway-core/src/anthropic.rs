@@ -165,3 +165,80 @@ impl AnthropicEventBuilder {
         out
     }
 }
+
+/// OpenAI ChatRequest → Anthropic Messages 请求体（出站方向，供 zcode/minimax
+/// 这类 Anthropic 协议上游使用）。system 消息合并为顶层 `system`；
+/// `system_prefix`（如 zcode 3012 官方身份块）置于最前。
+pub fn openai_to_anthropic_body(req: &ChatRequest, system_prefix: Option<&str>) -> Value {
+    let mut system_parts: Vec<String> = Vec::new();
+    if let Some(p) = system_prefix {
+        system_parts.push(p.to_string());
+    }
+    let mut messages: Vec<Value> = Vec::new();
+    for m in &req.messages {
+        if m.role == "system" {
+            let t = m.text();
+            if !t.is_empty() {
+                system_parts.push(t);
+            }
+            continue;
+        }
+        messages.push(json!({ "role": m.role, "content": m.content }));
+    }
+    let max_tokens = req.raw.get("max_tokens").and_then(Value::as_u64).unwrap_or(8192);
+    let mut body = json!({
+        "model": &req.model,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    });
+    if !system_parts.is_empty() {
+        body["system"] = json!(system_parts.join("\n\n"));
+    }
+    if let Some(temp) = req.raw.get("temperature") {
+        body["temperature"] = temp.clone();
+    }
+    body
+}
+
+/// 上游 Anthropic message 响应 → ChatCompletion。
+pub fn completion_from_anthropic(model: &str, v: &Value) -> Result<ChatCompletion, String> {
+    let content = v
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    if content.is_empty() && v.get("type").and_then(Value::as_str) != Some("message") {
+        return Err(format!("unexpected upstream body: {}", v));
+    }
+    let usage = Usage {
+        prompt_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
+        completion_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        total_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0)
+            + v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+    };
+    let stop = v.get("stop_reason").and_then(Value::as_str).unwrap_or("stop");
+    let finish = match stop {
+        "max_tokens" => "length".to_string(),
+        "tool_use" => "tool_calls".to_string(),
+        other => other.to_string(),
+    };
+    let id = v.get("id").and_then(Value::as_str).unwrap_or("msg").to_string();
+    Ok(ChatCompletion {
+        id: format!("chatcmpl-{id}"),
+        object: "chat.completion",
+        created: crate::openai::now_ts(),
+        model: model.to_string(),
+        choices: vec![crate::openai::Choice {
+            index: 0,
+            message: crate::openai::OutMessage { role: "assistant".into(), content },
+            finish_reason: Some(finish),
+        }],
+        usage,
+    })
+}

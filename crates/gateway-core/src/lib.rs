@@ -14,6 +14,7 @@ pub mod openai;
 pub mod orchestrate;
 pub mod pool;
 pub mod provider;
+pub mod providers;
 pub mod refresh;
 pub mod registry;
 pub mod route;

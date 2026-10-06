@@ -86,7 +86,8 @@ pub async fn start_with_ledger(
     ledger: Option<Arc<crate::ledger::Ledger>>,
 ) -> std::io::Result<GatewayHandle> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = config.port.unwrap_or(0);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
     let providers: HashMap<String, Arc<dyn Provider>> =
         providers.into_iter().map(|p| (p.id().to_string(), p)).collect();
