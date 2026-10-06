@@ -50,6 +50,8 @@ async fn spawn() -> (String, Arc<Mutex<Stub>>) {
     let cap = Arc::new(Mutex::new(Stub::default()));
     let app = Router::new()
         .route("/v1internal:streamGenerateContent", post(stub_generate))
+        // T4.2b 起 send 前必探测 project；空响应 → 兜底 aicode-consumers
+        .route("/v1internal:loadCodeAssist", post(|| async { Json(json!({})) }))
         .with_state(cap.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();

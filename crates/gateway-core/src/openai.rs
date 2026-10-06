@@ -21,6 +21,12 @@ pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: Value,
+    /// assistant 消息的工具调用（OpenAI `tool_calls` 形态，原样保留）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
+    /// `role:tool` 消息关联的调用 id（映射到 assistant `tool_calls[].id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -57,7 +63,7 @@ impl ChatCompletion {
             model,
             choices: vec![Choice {
                 index: 0,
-                message: OutMessage { role: "assistant".into(), content },
+                message: OutMessage { role: "assistant".into(), content, tool_calls: None },
                 finish_reason: Some("stop".into()),
             }],
             usage,
@@ -76,6 +82,9 @@ pub struct Choice {
 pub struct OutMessage {
     pub role: String,
     pub content: String,
+    /// OpenAI `tool_calls` 形态（仅工具调用响应携带）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]

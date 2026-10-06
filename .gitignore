@@ -21,3 +21,4 @@ design/round-01/vendor/
 # Rust
 crates/target/
 tsconfig.tsbuildinfo
+.vite/

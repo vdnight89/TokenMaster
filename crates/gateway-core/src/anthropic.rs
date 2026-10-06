@@ -42,6 +42,8 @@ impl AnthropicRequest {
                 messages.push(crate::openai::ChatMessage {
                     role: "system".into(),
                     content: Value::String(text),
+                    tool_calls: None,
+                    tool_call_id: None,
                 });
             }
         }
@@ -239,7 +241,7 @@ pub fn completion_from_anthropic(model: &str, v: &Value) -> Result<ChatCompletio
         model: model.to_string(),
         choices: vec![crate::openai::Choice {
             index: 0,
-            message: crate::openai::OutMessage { role: "assistant".into(), content },
+            message: crate::openai::OutMessage { role: "assistant".into(), content, tool_calls: None },
             finish_reason: Some(finish),
         }],
         usage,
