@@ -22,6 +22,7 @@ import Settings from "./pages/Settings";
 import AddModal from "./modals/AddModal";
 import ClaimModal from "./modals/ClaimModal";
 import ImportModal from "./modals/ImportModal";
+import { winClose, winMinimize, winToggleMaximize } from "./lib/window";
 
 export default function App() {
   const [page, go] = useHashPage();
@@ -82,12 +83,18 @@ export default function App() {
 
   return (
     <>
-      {/* 顶栏拖拽区（桌面壳） */}
-      <div className="topbar">
-        <div className="traffic">
-          <i></i>
-          <i></i>
-          <i></i>
+      {/* 顶栏 = 拖拽区 + 窗控（T6.0 自定义标题栏；浏览器环境下窗控 no-op） */}
+      <div className="topbar" data-tauri-drag-region onDoubleClick={winToggleMaximize}>
+        <div className="traffic" onDoubleClick={e => e.stopPropagation()}>
+          <button className="t-close" title="关闭" onClick={winClose}>
+            <Ic name="x" size={8} />
+          </button>
+          <button className="t-min" title="最小化" onClick={winMinimize}>
+            <Ic name="minus" size={8} />
+          </button>
+          <button className="t-max" title="最大化 / 还原" onClick={winToggleMaximize}>
+            <Ic name="square" size={8} />
+          </button>
         </div>
         <span>TokenMaster</span>
         <span className="grow"></span>

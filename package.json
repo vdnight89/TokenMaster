@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@lobehub/icons": "^5.23.0",
+    "@tauri-apps/api": "^2.12.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

@@ -594,3 +594,28 @@ table.tbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size
 /* rlabel 标题/描述需纵向堆叠（对齐原型 app.css 中被漏拷的声明） */
 .rlabel .rt { display: block; }
 .rlabel .rd { display: block; margin-top: 2px; line-height: 1.5; }
+
+/* ===== T6.0 自定义标题栏窗控（traffic 三点功能化） ===== */
+.topbar .traffic button {
+  appearance: none;
+  border: 0;
+  padding: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #2f3746;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  color: transparent;
+  transition: background .12s ease, color .12s ease;
+}
+.topbar .traffic button svg { opacity: 0; transition: opacity .12s ease; }
+.topbar .traffic button:hover svg,
+.topbar .traffic button:focus-visible svg { opacity: 1; }
+.topbar .traffic .t-close:hover,
+.topbar .traffic .t-close:focus-visible { background: var(--err); color: #fff; }
+.topbar .traffic .t-min:hover,
+.topbar .traffic .t-min:focus-visible { background: var(--warn); color: #fff; }
+.topbar .traffic .t-max:hover,
+.topbar .traffic .t-max:focus-visible { background: var(--ok); color: #fff; }

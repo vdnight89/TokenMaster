@@ -11,6 +11,9 @@ importers:
       '@lobehub/icons':
         specifier: ^5.23.0
         version: 5.23.0(@lobehub/ui@5.57.0)(@types/react@19.3.0)(antd@6.6.5(react-dom@19.3.0(react@19.3.0))(react@19.3.0))(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+      '@tauri-apps/api':
+        specifier: ^2.12.1
+        version: 2.12.1
       react:
         specifier: ^19.2.0
         version: 19.3.0
@@ -1299,6 +1302,9 @@ packages:
   '@tanstack/table-core@9.2.6':
     resolution: {integrity: sha512-t5LaLx8gDCgzjvwtZo5xtLklJP11D9zaKOW8q6jOCyuQYhkqpTK1heqMfgTQwDlhl0dU8f1X66Xurbj3jpCUSw==}
     engines: {node: '>=20'}
+
+  '@tauri-apps/api@2.12.1':
+    resolution: {integrity: sha512-DeyFHa3wynpyoqTDikDEDGTJIq4LQ5USfolQGRmGIWT6JMADyxZBTDa5cAdT3tDg73rUXufPaCwN7aXBos4OnQ==}
 
   '@tauri-apps/cli-darwin-arm64@2.12.1':
     resolution: {integrity: sha512-8bMnbpJ2jKO/ufrOPL65EMHC3ptw7fzeraoQkwibyfGLqIl+UCWsC0152kmNbW6r9NvVQduXqAZF5mH1QgTWhw==}
@@ -4143,6 +4149,8 @@ snapshots:
   '@tanstack/table-core@9.2.6':
     dependencies:
       '@tanstack/store': 0.11.2
+
+  '@tauri-apps/api@2.12.1': {}
 
   '@tauri-apps/cli-darwin-arm64@2.12.1':
     optional: true
