@@ -100,6 +100,8 @@ pub struct ZcodeProvider {
     version: String,
     device_mid: String,
     system_prefix: Option<String>,
+    /// 订阅腿端点（默认生产 api.z.ai；测试注入 stub）。
+    coding_plan_base: String,
 }
 
 impl ZcodeProvider {
@@ -116,7 +118,14 @@ impl ZcodeProvider {
                 crate::key::random_id(6)
             ),
             system_prefix: None,
+            coding_plan_base: CODING_PLAN_API_BASE.into(),
         }
+    }
+
+    /// 注入订阅腿端点（测试）。
+    pub fn with_coding_plan_base(mut self, base: String) -> Self {
+        self.coding_plan_base = base;
+        self
     }
 
     pub fn production() -> Self {
@@ -178,10 +187,27 @@ impl ZcodeProvider {
                     .or_else(|| v.pointer("/token/zcodejwttoken"))
                     .or_else(|| v.get("token"))
                     .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty() && !t.starts_with('{'))
                     .ok_or_else(|| ProviderError::Upstream("login poll ok but no token".into()))?;
+                // OAuth token 宽松提取（登录结果必然带 zai 或 bigmodel 之一，
+                // 是订阅腿换 key 的原料）；没有则裸串（历史兼容）
+                let mut m = serde_json::Map::new();
+                m.insert("zcode_jwt".into(), Value::String(token.to_string()));
+                for (field, names) in [
+                    ("zai_access_token", ["zaiAccessToken", "zai_access_token", "zai_token"]),
+                    ("bigmodel_access_token", ["bigmodelAccessToken", "bigmodel_access_token", "bigmodel_token"]),
+                ] {
+                    for n in names {
+                        if let Some(t) = v.get(n).and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                            m.insert(field.into(), Value::String(t.to_string()));
+                            break;
+                        }
+                    }
+                }
+                let secret = if m.len() > 1 { Value::Object(m).to_string() } else { token.to_string() };
                 Ok(Some(Credential {
                     account_id: format!("zcode-{}", &flow.flow_id[..8.min(flow.flow_id.len())]),
-                    secret: token.to_string(),
+                    secret,
                 }))
             }
             _ => Ok(None),
@@ -189,18 +215,40 @@ impl ZcodeProvider {
     }
 
     /// 完整登录：init + 轮询到拿到凭据（默认节奏由 `login` 提供）。
+    /// 阻塞轮询到登录成功；成功后**顺手换** coding-plan 的 api-key（付费
+    /// 订阅腿）——换不到不报错（没订阅是常态），按登录渠道写
+    /// coding_plan_key_zai / coding_plan_key_bigmodel（zcode-auth.ts:592-613）。
     pub async fn login_with_interval(&self, interval: std::time::Duration) -> Result<Credential, ProviderError> {
         let flow = self.login_init().await?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
             if let Some(cred) = self.login_poll(&flow).await? {
-                return Ok(cred);
+                return Ok(self.attach_coding_plan_key(cred).await);
             }
             if std::time::Instant::now() > deadline {
                 return Err(ProviderError::Upstream("login poll timeout (300s)".into()));
             }
             tokio::time::sleep(interval).await;
         }
+    }
+
+    /// 登录成功后顺手换订阅 key（失败吞掉，不影响 start-plan）。
+    pub async fn attach_coding_plan_key(&self, cred: Credential) -> Credential {
+        let Ok(Some(key)) = self.resolve_coding_plan_key(&cred).await else {
+            return cred;
+        };
+        let Ok(mut v) = serde_json::from_str::<Value>(&cred.secret) else {
+            return cred;
+        };
+        let Some(obj) = v.as_object_mut() else { return cred };
+        // 按「拿到哪个 OAuth token」落位（zai ?? bigmodel 优先级一致）
+        let field = if obj.contains_key("zai_access_token") {
+            "coding_plan_key_zai"
+        } else {
+            "coding_plan_key_bigmodel"
+        };
+        obj.insert(field.into(), Value::String(key));
+        Credential { secret: Value::Object(obj.clone()).to_string(), ..cred }
     }
 
     /// 余额（token 计）：需 Authorization + X-Device-Mid（identity_headers 已带）。
@@ -423,9 +471,14 @@ impl ZcodeProvider {
     }
 
     fn identity_headers(&self, cred: &Credential) -> reqwest::header::HeaderMap {
+        let zc = parse_zcode_cred(&cred.secret);
+        self.identity_headers_raw(&zc)
+    }
+
+    fn identity_headers_raw(&self, zc: &ZcodeCred) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
         let ins = reqwest::header::HeaderValue::from_str;
-        let _ = ins(&format!("Bearer {}", cred.secret)).map(|v| h.insert("authorization", v));
+        let _ = ins(&format!("Bearer {}", zc.zcode_jwt)).map(|v| h.insert("authorization", v));
         let _ = ins("2023-06-01").map(|v| h.insert("anthropic-version", v));
         let _ = ins(&format!("ZCode/{}", self.version)).map(|v| h.insert("user-agent", v));
         let _ = ins("https://zcode.z.ai").map(|v| h.insert("http-referer", v));
@@ -439,19 +492,66 @@ impl ZcodeProvider {
         h
     }
 
+    /// 按通道发送推理请求；429 + 1005/1113（两通道额度独立）且另一通道
+    /// 可用时换腿重发一次。401/1002（同凭据）、3012（风控重试加重惩罚）、
+    /// 3009（并发走退避）**都不换**。
+    async fn dispatch(
+        &self,
+        cred: &Credential,
+        route: &Route,
+        body: &Value,
+    ) -> Result<Result<reqwest::Response, ProviderError>, ProviderError> {
+        let zc = parse_zcode_cred(&cred.secret);
+        let channel = resolve_channel_for(&route.model, cred);
+        let other = !channel;
+        let send = |ch: ZcodeChannel| {
+            let url = match ch {
+                ZcodeChannel::StartPlan => format!("{}{}", self.base, MESSAGES_PATH),
+                ZcodeChannel::CodingPlan => format!("{}{}", self.coding_plan_base, CODING_PLAN_MESSAGES_PATH),
+            };
+            let headers = self.identity_headers_for(&zc, ch);
+            let client = &self.client;
+            async move {
+                client
+                    .post(&url)
+                    .headers(headers)
+                    .json(body)
+                    .send()
+                    .await
+                    .map_err(|e| ProviderError::Upstream(e.to_string()))
+            }
+        };
+        let resp = send(channel).await?;
+        if resp.status().as_u16() != 429 {
+            return Ok(Ok(resp));
+        }
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let text = resp.text().await.unwrap_or_default();
+        let quota_like = text.contains("1005") || text.contains("1113");
+        if quota_like && channel_available(other, &zc) {
+            // 换腿重发一次（不重产 captcha——param 一次性，这里本就不带）
+            let resp2 = send(other).await?;
+            return Ok(Ok(resp2));
+        }
+        Ok(Err(ProviderError::RateLimited {
+            retry_after_secs: Some(retry_after.unwrap_or(60)),
+            msg: truncate(&text),
+        }))
+    }
+
     async fn post_messages(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChatCompletion, ProviderError> {
         // 上游要裸模型名（route.model 已剥离 provider 前缀）
         let mut upstream_req = req.clone();
         upstream_req.model = route.model.clone();
         let body = openai_to_anthropic_body(&upstream_req, self.system_prefix.as_deref());
-        let resp = self
-            .client
-            .post(format!("{}{}", self.base, MESSAGES_PATH))
-            .headers(self.identity_headers(cred))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let resp = match self.dispatch(cred, route, &body).await? {
+            Ok(resp) => resp,
+            Err(e) => return Err(e),
+        };
         if resp.status().as_u16() == 200 {
             let v: Value = resp.json().await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
             return completion_from_anthropic(&route.composite(), &v)
@@ -591,14 +691,10 @@ impl Provider for ZcodeProvider {
         upstream_req.model = route.model.clone();
         upstream_req.stream = true;
         let body = openai_to_anthropic_body(&upstream_req, self.system_prefix.as_deref());
-        let resp = self
-            .client
-            .post(format!("{}{}", self.base, MESSAGES_PATH))
-            .headers(self.identity_headers(cred))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let resp = match self.dispatch(cred, route, &body).await? {
+            Ok(resp) => resp,
+            Err(e) => return Err(e),
+        };
         if resp.status().as_u16() != 200 {
             return Err(map_upstream_error(resp).await);
         }
@@ -653,4 +749,215 @@ impl Provider for ZcodeProvider {
         });
         Ok(Box::pin(stream))
     }
+}
+
+// ───────────── 订阅双通道（T4.16，参考 zcode-transport.ts + zcode-pool oauth.rs） ─────────────
+
+/// 订阅腿端点（官方规则：订阅制才走 api.z.ai）。
+pub const CODING_PLAN_API_BASE: &str = "https://api.z.ai";
+const CODING_PLAN_MESSAGES_PATH: &str = "/api/anthropic/v1/messages";
+/// 官方写死的 key 名（**不是 "zcode"**——写错换取永远 no-key）。
+const BIZ_API_KEY_NAME: &str = "zcode-api-key";
+
+/// 两条上游通道。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZcodeChannel {
+    /// 免费积分（zcode.z.ai + zcode_jwt），模型同属两通道时优先。
+    StartPlan,
+    /// 付费订阅（api.z.ai + coding_plan_key_*）。
+    CodingPlan,
+}
+
+impl std::ops::Not for ZcodeChannel {
+    type Output = ZcodeChannel;
+    fn not(self) -> ZcodeChannel {
+        match self {
+            ZcodeChannel::StartPlan => ZcodeChannel::CodingPlan,
+            ZcodeChannel::CodingPlan => ZcodeChannel::StartPlan,
+        }
+    }
+}
+
+/// 两条通道各自承载的模型（transport.ts CHANNEL_MODELS，键为小写）。
+const START_PLAN_MODELS: [&str; 3] = ["glm-5.3-flash", "glm-5.2", "glm-5-turbo"];
+/// 订阅白名单只开官方 builtinModelIds 确认过的两个。
+const CODING_PLAN_MODELS: [&str; 2] = ["glm-5.3", "glm-5.3-flash"];
+
+/// 解析后的 zcode 凭据（secret 为 JSON 形态；裸串 = zcode_jwt 历史兼容）。
+#[derive(Debug, Clone, Default)]
+pub struct ZcodeCred {
+    pub zcode_jwt: String,
+    pub zai_access_token: Option<String>,
+    pub bigmodel_access_token: Option<String>,
+    pub coding_plan_key_zai: Option<String>,
+    pub coding_plan_key_bigmodel: Option<String>,
+}
+
+pub fn parse_zcode_cred(secret: &str) -> ZcodeCred {
+    let Ok(v) = serde_json::from_str::<Value>(secret) else {
+        return ZcodeCred { zcode_jwt: secret.to_string(), ..Default::default() };
+    };
+    let s = |k: &str| v.get(k).and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
+    ZcodeCred {
+        zcode_jwt: s("zcode_jwt").unwrap_or_default(),
+        zai_access_token: s("zai_access_token"),
+        bigmodel_access_token: s("bigmodel_access_token"),
+        coding_plan_key_zai: s("coding_plan_key_zai"),
+        coding_plan_key_bigmodel: s("coding_plan_key_bigmodel"),
+    }
+}
+
+fn channel_available(channel: ZcodeChannel, zc: &ZcodeCred) -> bool {
+    match channel {
+        ZcodeChannel::StartPlan => !zc.zcode_jwt.is_empty(),
+        ZcodeChannel::CodingPlan => {
+            zc.coding_plan_key_zai.as_deref().is_some_and(|k| !k.is_empty())
+                || zc.coding_plan_key_bigmodel.as_deref().is_some_and(|k| !k.is_empty())
+        }
+    }
+}
+
+/// 模型 → 通道：同属两通道时 start-plan 优先；凭据不具备时回退 start-plan。
+pub fn resolve_channel_for(model: &str, cred: &Credential) -> ZcodeChannel {
+    let zc = parse_zcode_cred(&cred.secret);
+    let key = model.trim().to_lowercase();
+    if START_PLAN_MODELS.contains(&key.as_str()) && channel_available(ZcodeChannel::StartPlan, &zc) {
+        return ZcodeChannel::StartPlan;
+    }
+    if CODING_PLAN_MODELS.contains(&key.as_str()) && channel_available(ZcodeChannel::CodingPlan, &zc) {
+        return ZcodeChannel::CodingPlan;
+    }
+    ZcodeChannel::StartPlan
+}
+
+impl ZcodeProvider {
+    /// 通道化请求头：start-plan 原样；coding-plan 换 Bearer key 并**删
+    /// HTTP-Referer**（transport.ts:126）。
+    fn identity_headers_for(&self, zc: &ZcodeCred, channel: ZcodeChannel) -> reqwest::header::HeaderMap {
+        let mut h = self.identity_headers_raw(zc);
+        match channel {
+            ZcodeChannel::StartPlan => {}
+            ZcodeChannel::CodingPlan => {
+                let key = zc
+                    .coding_plan_key_zai
+                    .as_deref()
+                    .or(zc.coding_plan_key_bigmodel.as_deref())
+                    .unwrap_or_default();
+                let _ = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+                    .map(|v| h.insert("authorization", v));
+                h.remove("http-referer");
+            }
+        }
+        h
+    }
+
+    /// 三步现换订阅 key（transport.ts:257-294；**只 GET 不建**——zcode-pool
+    /// 会 POST 创建，保守对齐 harness）。失败吞成 None（没订阅是常态，
+    /// start-plan 不受影响）。
+    pub async fn resolve_coding_plan_key(&self, cred: &Credential) -> Result<Option<String>, ProviderError> {
+        let zc = parse_zcode_cred(&cred.secret);
+        let Some(token) = zc.zai_access_token.as_deref().or(zc.bigmodel_access_token.as_deref()) else {
+            return Ok(None); // 无 OAuth token 短路，不发请求
+        };
+        let get_json = |url: String, auth: String| {
+            let client = &self.client;
+            async move {
+                let resp = client
+                    .get(&url)
+                    .header("authorization", format!("Bearer {auth}"))
+                    .header("content-type", "application/json")
+                    .send()
+                    .await
+                    .ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                resp.json::<Value>().await.ok()
+            }
+        };
+        // ① 组织与项目（挑默认机构/默认项目，projectType=="2" 剔除）
+        let info = get_json(
+            format!("{}/api/biz/customer/getCustomerInfo", self.coding_plan_base),
+            token.to_string(),
+        )
+        .await
+        .or_else(|| None);
+        let Some(info) = info else { return Ok(None) };
+        let Some((org, proj)) = pick_org_project(&info) else { return Ok(None) };
+        // ② 列 api_keys 找 zcode-api-key
+        let keys_url = format!(
+            "{}/api/biz/v1/organization/{org}/projects/{proj}/api_keys",
+            self.coding_plan_base
+        );
+        let Some(list) = get_json(keys_url.clone(), token.to_string()).await else { return Ok(None) };
+        let api_key = list
+            .as_array()
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|k| k.get("name").and_then(Value::as_str) == Some(BIZ_API_KEY_NAME))
+                    .and_then(|k| k.get("apiKey").and_then(Value::as_str))
+                    .map(str::to_string)
+            })
+            .filter(|k| !k.trim().is_empty());
+        let Some(api_key) = api_key else { return Ok(None) };
+        // ③ copy 取 secretKey → "apiKey.secret"
+        let copied = get_json(format!("{keys_url}/copy/{api_key}"), token.to_string()).await;
+        let secret = copied
+            .as_ref()
+            .and_then(|v| v.get("secretKey").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        Ok(Some(match secret {
+            Some(s) => format!("{api_key}.{s}"),
+            None => return Ok(None),
+        }))
+    }
+}
+
+/// 挑默认机构/项目：projectType=="2" 剔除；名称含「默认」优先，否则第一个
+/// 有合法项目的机构（zcode-pool oauth.rs:494-540）。
+fn pick_org_project(customer: &Value) -> Option<(String, String)> {
+    let root = customer.get("data").unwrap_or(customer);
+    let orgs = root.get("organizations")?.as_array()?;
+    let id_of = |v: &Value| -> Option<String> {
+        match v {
+            Value::String(s) => (!s.is_empty()).then(|| s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
+    };
+    let keep = |p: &Value| -> bool {
+        match p.get("projectType") {
+            Some(Value::String(s)) => s.trim() != "2",
+            Some(Value::Number(n)) => n.to_string() != "2",
+            _ => true,
+        }
+    };
+    let mut fallback: Option<(String, String)> = None;
+    for o in orgs {
+        let Some(org_id) = o.get("organizationId").and_then(id_of) else { continue };
+        let org_is_default = o
+            .get("organizationName")
+            .and_then(Value::as_str)
+            .is_some_and(|n| n.contains("默认"));
+        let projects: Vec<&Value> = o
+            .get("projects")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter(|p| keep(p)).collect())
+            .unwrap_or_default();
+        if projects.is_empty() {
+            continue;
+        }
+        let default_proj = projects.iter().find(|p| {
+            p.get("projectName").and_then(Value::as_str).is_some_and(|n| n.contains("默认"))
+        });
+        let chosen = default_proj.copied().or_else(|| projects.first().copied())?;
+        let Some(proj_id) = chosen.get("projectId").and_then(id_of) else { continue };
+        if org_is_default {
+            return Some((org_id, proj_id));
+        }
+        fallback.get_or_insert((org_id, proj_id));
+    }
+    fallback
 }
