@@ -54,7 +54,7 @@
 | T4.2 | gemini：CloudCode 上游、OAuth 回调、双层信封、thoughtSignature、Antigravity 身份 | 2 | doing(机制全done：推理信封/五身份头/project探测/配额/工具链/thoughtSignature/sessionId升代/OAuth全链路；⚠️生产 client_id+六项scope 逐字值待用户提供——手册未载明，给值后一行接线即 done) | M1, M2 |
 | T4.3 | commandcode：私有信封、每 key 设备指纹(HMAC)、SSE 转译、user_ key 透传 | 2 | done(机制全；值级待补：工具别名表余3条/指纹候选池逐字清单/硬编码MODELS回退——手册未载明，见 dev-log) | M1, M2 |
 | T4.4 | trae：SOLO 载荷/SSE、本地回调 18080、Cloud-IDE-JWT | 2 | doing(T4.4a 凭据/头族/登录回调两套流程/余额 done；⚠️SOLO 推理阻塞：transformToSOLOBody 与 SSE 事件 wire 形态手册概要级无样例，待用户提供) | M1, M2 |
-| T4.5 | qoder：PKCE 设备码、WASM 请求加密(wasmtime)、信封解包、双推理路径 | 2 | doing(T4.5a 信封解包done：结构分类/心跳跳过/code保真；WASM加密/登录/credits 待续) | M1, M2 |
+| T4.5 | qoder：PKCE 设备码、WASM 请求加密(wasmtime)、信封解包、双推理路径 | 2 | doing(T4.5a/b done：信封解包+credits/领取/错误码分类；WASM加密/设备码登录/双推理路径 待续) | M1, M2 |
 | T4.6 | qodercn：复用 qoder，仅换端点/client_id | 2 | todo | T4.5 |
 | T4.7 | cline：WorkOS 设备码、`workos:` Bearer 前缀、OpenAI 兼容 | 2 | todo | M1, M2 |
 | T4.8 | minimax：设备码+PKCE、Anthropic Messages 协议、refresh 轮换 | 2 | todo | M1, M2 |
