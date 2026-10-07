@@ -84,7 +84,7 @@
 | T5.7 | 用量页：分段/汇总卡/四类图表/聚合表 | — | done(agent) | T5.2 |
 | T5.8 | 日志页：过滤/监控表/行展开换号轨迹 | — | done(agent) | T5.1 |
 | T5.9 | 接入页 + 设置页（代理三级覆盖 UI） | — | done(agent) | T5.1 |
-| T5.10 | i18n 双语（zh/en 词条表 + t()，与 Rust 错误词表对齐） | — | todo | T5.3-T5.9 |
+| T5.10 | i18n 双语（zh/en 词条表 + t()，与 Rust 错误词表对齐） | — | done(zh/en 120+ 词条 + t()/useLang()/localStorage + Settings 切换 UI) | T5.3-T5.9 |
 | T5.11 | IPC 接线：mock 数据逐页替换为 Tauri command 真数据 | — | todo | T0.3, M1-M3, T5.3-T5.9 |
 | T5.12 | Provider/模型品牌图标：优先接入 @lobehub/icons（icons.lobehub.com，先确认许可并在 README/设置页署名），替换账号卡/仪表盘池仪表/映射表/日志模型列/接入页模型表/用量图例等处的色块字母；模型按家族前缀映射（glm→Zhipu、claude→Anthropic、gemini→Google、qwen→Qwen、deepseek→DeepSeek、MiniMax、gpt→OpenAI、kimi→Moonshot）；lobehub 未收录的 provider（commandcode/lobsterai/loomy/raccoon/workbuddy/qodercn/buddy 等）联网检索官方品牌图或沿用现有彩色字母徽章兜底；图标统一走 `src/lib/brand.tsx` 单一出口，离线打包不引运行时网络资源 | — | done(agent) | T5.3-T5.9（纯前端，可与 M4 并行） |
 
@@ -93,7 +93,7 @@
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
 | T6.0 | 【用户指定优先】无边框窗口 + 自定义标题栏：`decorations:false` 去掉 Windows 原生标题栏；用 round-02 原型 topbar 的 traffic 三点（红关/黄最小化/绿最大化，hover 显示图标）作为窗控，顶栏整体设为拖拽区（data-tauri-drag-region）、双击切换最大化；保留右侧网关状态芯片与版本号不受拖拽影响；关闭行为遵循"关窗最小化到托盘"设置（T6.1 联动）；截图自查与原型对照 | — | done(托盘联动留T6.1) | T0.3 |
-| T6.1 | 托盘（菜单/tooltip）+ 单实例 + 开机自启 + 关窗最小化 | — | todo | T0.3 |
+| T6.1 | 托盘（菜单/tooltip）+ 单实例 + 开机自启 + 关窗最小化 | — | done(single-instance 聚焦/autostart 插件/关窗→hide 托盘不退出) | T0.3 |
 | T6.2 | zcode-pool 导入实现（enc:v1 兼容解析，读其账号目录） | 2 | todo | T2.1, T4.1 |
 | T6.3 | 验证码载体：WebView 子窗口按需拉起 + 供应池退避 | 2 | todo | T0.3, T4.1 |
 | T6.4 | 签到调度（手动 + 可选自动轮询） | 2 | todo | M4 |

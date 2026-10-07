@@ -30,7 +30,25 @@ fn gateway_status(state: State<GatewayState>) -> Result<serde_json::Value, Strin
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // 单实例：已有实例运行时聚焦主窗口
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(GatewayState { handle: Mutex::new(None) })
+        .on_window_event(|window, event| {
+            // 关窗最小化到托盘（不退出）；托盘菜单的「退出」才真正 close
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
         .setup(|app| {
             let state = app.state::<GatewayState>();
             // 网关随 GUI 启动（spec：桌面内嵌运行）。密钥先随机生成；
@@ -48,6 +66,9 @@ pub fn run() {
             ))
             .map_err(|e| format!("gateway start failed: {e}"))?;
             *state.handle.lock().unwrap() = Some(handle);
+
+            // T6.1 托盘：菜单（显示/退出）+ tooltip
+            let _tray = app.tray_by_id("main");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![ping, gateway_status])

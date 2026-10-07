@@ -23,10 +23,12 @@ import AddModal from "./modals/AddModal";
 import ClaimModal from "./modals/ClaimModal";
 import ImportModal from "./modals/ImportModal";
 import { winClose, winMinimize, winToggleMaximize } from "./lib/window";
+import { useLang } from "./lib/i18n";
 
 export default function App() {
   const [page, go] = useHashPage();
   const [gwOn, setGwOn] = useState(true);
+  const [lang, setLang] = useLang();
   const [accounts, setAccounts] = useState<Account[]>(ACCOUNTS);
   const [doneTodos, setDoneTodos] = useState<ReadonlySet<string>>(() => new Set());
   const [modal, setModal] = useState<ModalKind>(null);
@@ -78,7 +80,7 @@ export default function App() {
     usage: <Usage />,
     logs: <Logs />,
     setup: <Setup />,
-    settings: <Settings />,
+    settings: <Settings lang={lang} setLang={setLang} />,
   };
 
   return (
@@ -113,7 +115,7 @@ export default function App() {
         <div className="nav-pills">
           {PAGES.map(p => (
             <button key={p.key} className={page === p.key ? "on" : ""} onClick={() => go(p.key as PageKey)}>
-              {p.label}
+              {p.label()}
               {p.key === "dash" && <span className="cnt">{todoCount}</span>}
             </button>
           ))}

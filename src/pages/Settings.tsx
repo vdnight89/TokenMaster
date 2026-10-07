@@ -1,10 +1,12 @@
 /** 设置页：通用 / 出站代理 / 数据 / 关于（对应原型 #page-settings，开关为原型 data-toggle 行为） */
 import { useState } from "react";
 import { Ic } from "../lib/icons";
+import { t } from "../lib/i18n";
+import type { Lang } from "../lib/i18n";
 import { toast } from "../lib/toast";
 import { ProviderBrandIcon } from "../lib/brand";
 
-export default function Settings() {
+export default function Settings({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) {
   const [autoStart, setAutoStart] = useState(false);
   const [trayMin, setTrayMin] = useState(true);
 
@@ -12,8 +14,8 @@ export default function Settings() {
     <div className="page-wrap">
       <div className="page-h">
         <div>
-          <h1>设置</h1>
-          <div className="sub">语言 / 托盘 / 自启 · 出站代理三级覆盖：全局 → Provider → 账号</div>
+          <h1>{t("settings.title")}</h1>
+          <div className="sub">Language / Tray / Autostart · Proxy: Global → Provider → Account</div>
         </div>
       </div>
 
@@ -32,8 +34,8 @@ export default function Settings() {
             </div>
             <div className="ctrl">
               <div className="seg">
-                <button className="on">中文</button>
-                <button>English</button>
+                <button className={lang === "zh" ? "on" : ""} onClick={() => setLang("zh")}>{t("settings.lang.zh")}</button>
+                <button className={lang === "en" ? "on" : ""} onClick={() => setLang("en")}>{t("settings.lang.en")}</button>
               </div>
             </div>
           </div>

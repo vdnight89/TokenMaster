@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
 
 /** 页面标识与 round-02 原型的 data-page 一致 */
+import { t } from "./i18n";
+
 export const PAGES = [
-  { key: "dash", label: "仪表盘" },
-  { key: "accounts", label: "账号" },
-  { key: "gateway", label: "网关" },
-  { key: "usage", label: "用量" },
-  { key: "logs", label: "日志" },
-  { key: "setup", label: "接入" },
-  { key: "settings", label: "设置" },
+  { key: "dash", label: () => t("nav.dash") },
+  { key: "accounts", label: () => t("nav.accounts") },
+  { key: "gateway", label: () => t("nav.gateway") },
+  { key: "usage", label: () => t("nav.usage") },
+  { key: "logs", label: () => t("nav.logs") },
+  { key: "setup", label: () => t("nav.setup") },
+  { key: "settings", label: () => t("nav.settings") },
 ] as const;
 
 export type PageKey = (typeof PAGES)[number]["key"];
