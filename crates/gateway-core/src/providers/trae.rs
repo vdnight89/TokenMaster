@@ -725,6 +725,10 @@ impl Provider for TraeProvider {
         "trae"
     }
 
+    async fn refresh(&self, cred: &Credential) -> Result<Credential, ProviderError> {
+        self.exchange_refresh(cred).await
+    }
+
     fn catalog(&self) -> crate::registry::ProviderCatalog {
         crate::registry::ProviderCatalog {
             id: "trae".into(),
@@ -738,7 +742,14 @@ impl Provider for TraeProvider {
         route: &Route,
         req: &ChatRequest,
     ) -> Result<ChatCompletion, ProviderError> {
-        let (status, body) = send_chat(self, cred, route, req).await?;
+        // 空响应（200 零可解析事件，含 metadata）→ 同账号重发一次；
+        // 已收到任何事件则绝不重放（trae-adapter.ts:1280-1289/1694-1699）
+        let (mut status, mut body) = send_chat(self, cred, route, req).await?;
+        if status == 200 && parse_solo_sse(&body).is_empty() {
+            let (s2, b2) = send_chat(self, cred, route, req).await?;
+            status = s2;
+            body = b2;
+        }
         if status != 200 {
             return Err(classify_trae_error(status, None, &body));
         }
@@ -774,7 +785,12 @@ impl Provider for TraeProvider {
         route: &Route,
         req: &ChatRequest,
     ) -> Result<ChunkStream, ProviderError> {
-        let (status, body) = send_chat(self, cred, route, req).await?;
+        let (mut status, mut body) = send_chat(self, cred, route, req).await?;
+        if status == 200 && parse_solo_sse(&body).is_empty() {
+            let (s2, b2) = send_chat(self, cred, route, req).await?;
+            status = s2;
+            body = b2;
+        }
         if status != 200 {
             return Err(classify_trae_error(status, None, &body));
         }
@@ -798,3 +814,309 @@ impl Provider for TraeProvider {
         Ok(Box::pin(futures::stream::iter(queue)))
     }
 }
+
+// ───────────── T4.19：签到设备派生 / ExchangeToken 续期 ─────────────
+
+/// seeded 派生流（trae.ts:353-373）：sha256("{salt}:{uid}" ++ counterBE32)
+/// 串联取 nbytes 字节——同 uid 恒定、跨 uid 互异。
+fn seeded_stream(uid: &str, salt: &str, nbytes: usize) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let prefix = format!("{salt}:{uid}");
+    let mut out: Vec<u8> = Vec::with_capacity(nbytes);
+    let mut counter: u32 = 0;
+    while out.len() < nbytes {
+        let mut h = Sha256::new();
+        h.update(prefix.as_bytes());
+        h.update(counter.to_be_bytes());
+        out.extend_from_slice(&h.finalize());
+        counter += 1;
+    }
+    out.truncate(nbytes);
+    out
+}
+
+/// 签到 X-Device-Id：15 位数字（每字节 %10，trae.ts:378-381）。
+pub fn derive_checkin_device_id(uid: &str) -> String {
+    seeded_stream(uid, "devid", 15)
+        .into_iter()
+        .map(|b| char::from(b'0' + b % 10))
+        .collect()
+}
+
+/// 签到 X-Market-User-ID：派生 UUIDv4（trae.ts:386-391 语义：version/variant 位改写）。
+fn derive_market_user_id(uid: &str) -> String {
+    let mut bs = seeded_stream(uid, "market", 16);
+    bs[6] = (bs[6] & 0x0F) | 0x40;
+    bs[8] = (bs[8] & 0x3F) | 0x80;
+    let hex: String = bs.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+}
+
+/// 签到 Vscode-Sessionid：派生 64hex（trae.ts:342-345）。
+fn derive_session_id_hex(uid: &str) -> String {
+    seeded_stream(uid, "session", 32).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+const CHECKIN_STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
+const CHECKIN_CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
+const EXCHANGE_PATH: &str = "/cloudide/api/v3/trae/oauth/ExchangeToken";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckinOutcome {
+    pub checked_in: bool,
+    pub credits: Option<u64>,
+    pub streak_days: Option<u64>,
+}
+
+impl TraeProvider {
+    /// 签到头族（traeCheckinHeaders，trae.ts:281-314）：设备身份按 uid
+    /// **确定性派生**（同账号稳定、跨账号互异——同天共用 device_id 会被
+    /// 「该设备已签到」拦截）。
+    fn checkin_headers(&self, cred: &Credential) -> Result<reqwest::header::HeaderMap, ProviderError> {
+        let v = parse_secret(&cred.secret)?;
+        let uid = secret_str(&v, "uid");
+        let token = secret_str(&v, "access_token");
+        let mut h = reqwest::header::HeaderMap::new();
+        let ins = reqwest::header::HeaderValue::from_str;
+        let _ = ins("application/json").map(|x| h.insert("content-type", x));
+        let _ = ins("*/*").map(|x| h.insert("accept", x));
+        let _ = ins("zh-CN").map(|x| h.insert("accept-language", x));
+        let _ = ins("VSCode 1.107.1 (TRAE SOLO CN)").map(|x| h.insert("user-agent", x));
+        let _ = ins(&format!("Cloud-IDE-JWT {token}")).map(|x| h.insert("authorization", x));
+        let _ = ins("VSCode 1.107.1").map(|x| h.insert("x-market-client-id", x));
+        let _ = ins(&derive_market_user_id(&uid)).map(|x| h.insert("x-market-user-id", x));
+        let _ = ins("CN").map(|x| h.insert("x-user-region", x));
+        let _ = ins(&derive_checkin_device_id(&uid)).map(|x| h.insert("x-device-id", x));
+        let _ = ins("3").map(|x| h.insert("x-lgw-req-sdk-type", x));
+        let _ = ins("stable_cn").map(|x| h.insert("package-type", x));
+        let _ = ins("787976").map(|x| h.insert("x-lscbd-aid", x));
+        let _ = ins("windows").map(|x| h.insert("x-lscbd-platform", x));
+        let _ = ins(IDE_VERSION).map(|x| h.insert("app-version", x));
+        let _ = ins(&derive_session_id_hex(&uid)).map(|x| h.insert("vscode-sessionid", x));
+        Ok(h)
+    }
+
+    /// ExchangeToken 续期（trae-auth.ts:378-432）：refreshToken 每次轮换
+    /// 旧值即刻失效**必须立即回写**；expires_at 归一毫秒字符串；
+    /// machine_id/device_id/uid/nickname 完全不动。401/403 或 2xx 无
+    /// accessToken 为终态（凭据失效时上游回 HTML 错误页，先读文本再 parse）。
+    pub async fn exchange_refresh(&self, cred: &Credential) -> Result<Credential, ProviderError> {
+        let v = parse_secret(&cred.secret)?;
+        let rt = secret_str(&v, "refresh_token");
+        if rt.is_empty() {
+            return Err(ProviderError::Credential("trae 凭据无 refresh_token".into()));
+        }
+        let mut h = reqwest::header::HeaderMap::new();
+        let ins = reqwest::header::HeaderValue::from_str;
+        let _ = ins("application/json").map(|x| h.insert("content-type", x));
+        let _ = ins("application/json").map(|x| h.insert("accept", x));
+        let _ = ins(USER_AGENT).map(|x| h.insert("user-agent", x));
+        let resp = self
+            .client
+            .post(format!("{}{}", self.api_base, EXCHANGE_PATH))
+            .headers(h)
+            .json(&serde_json::json!({
+                "ClientID": "en1oxy7wnw8j9n",
+                "RefreshToken": rt,
+                "ClientSecret": "-",
+                "UserID": ""
+            }))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        if status == 401 || status == 403 {
+            return Err(ProviderError::Credential(format!(
+                "ExchangeToken http {status}: {}",
+                text.chars().take(120).collect::<String>()
+            )));
+        }
+        if status != 200 {
+            return Err(ProviderError::Upstream(format!("ExchangeToken http {status}")));
+        }
+        let parsed: Value = serde_json::from_str(&text)
+            .map_err(|_| ProviderError::Credential("ExchangeToken 响应非 JSON（疑似登录失效 HTML 页）".into()))?;
+        let result = parsed.get("Result").cloned().unwrap_or(parsed);
+        let g = |names: [&str; 3]| -> Option<String> {
+            for n in names {
+                if let Some(s) = result.get(n).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    return Some(s.to_string());
+                }
+            }
+            None
+        };
+        let Some(new_token) = g(["Token", "token", "accessToken"]) else {
+            return Err(ProviderError::Credential("ExchangeToken 2xx 但无 accessToken（终态）".into()));
+        };
+        // rt 轮换：新值为空保留旧值
+        let new_rt = g(["RefreshToken", "refreshToken", "refresh_token"]).unwrap_or_else(|| rt.clone());
+        // expires_at 毫秒字符串归一（trae.ts:619-629 三态）
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let expire_at = result
+            .get("TokenExpireAt")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let duration = result
+            .get("TokenExpireDuration")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let expires_ms = if expire_at > 1_000_000_000_000 {
+            expire_at
+        } else if expire_at > 1_000_000_000 {
+            expire_at * 1000
+        } else if duration > 0 {
+            now_ms + duration * 1000
+        } else {
+            0
+        };
+        let mut out = v.clone();
+        let Some(obj) = out.as_object_mut() else {
+            return Err(ProviderError::Credential("trae 凭据非 JSON".into()));
+        };
+        obj.insert("access_token".into(), Value::String(new_token));
+        obj.insert("refresh_token".into(), Value::String(new_rt));
+        if expires_ms > 0 {
+            obj.insert("expires_at".into(), Value::String(expires_ms.to_string()));
+        }
+        Ok(Credential { secret: out.to_string(), ..cred.clone() })
+    }
+}
+
+// ───────────── T4.19：签到 / 模型目录 / Provider::refresh ─────────────
+
+const MODELS_PATH: &str = "/api/ide/v1/batch_get_detail_param";
+/// functions 必须传**全部 22 个**（trae-auth.ts:677-686；只传聊天通道会
+/// 导致响应错位）。
+const ALL_FUNCTIONS: [&str; 22] = [
+    "ui_builder_v2", "solo_coder", "chat_v3", "solo_builder",
+    "builder_v3", "builder", "chat", "inline_chat", "git_ai",
+    "custom_agent_generation", "utils", "code_reviewer",
+    "code_review_summary", "solo_agent", "solo_agent_remote",
+    "solo_work_remote", "solo_agent_lite", "solo_work_lite",
+    "solo_design_lite", "solo_design_remote", "multimodal",
+    "system_diagnosis",
+];
+
+impl TraeProvider {
+    /// 模型目录（trae-auth.ts:676-711 + trae.ts:1211-1268）：非流式头；
+    /// 白名单通道整组过滤 + 条目三重过滤（usage==chat_completion、
+    /// config_switch!=false、!is_invisible_to_user）；同 config_name
+    /// 多通道**后覆盖前**（参考规则 3；规则 1/2 的档位择优在接入档位
+    /// 元数据时补）。
+    pub async fn fetch_models(
+        &self,
+        cred: &Credential,
+    ) -> Result<Vec<crate::registry::ModelInfo>, ProviderError> {
+        let resp = self
+            .client
+            .post(format!("{}{}", self.agent_base, MODELS_PATH))
+            .headers(Self::solo_headers_with(cred, false, 0))
+            .json(&serde_json::json!({
+                "functions": ALL_FUNCTIONS,
+                "agent_type": "",
+                "current_config_info": { "config_name": "", "is_custom_model": false },
+                "mode_type": 0,
+                "access_type": 0,
+                "ab_force_vids": "",
+                "ab_autotest_advanced_mode": 0,
+                "show_custom_model": true,
+            }))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        if status != 200 {
+            return Err(ProviderError::Upstream(format!("models http {status}")));
+        }
+        let v: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ProviderError::Upstream(format!("models 响应非 JSON: {e}")))?;
+        let groups = v
+            .get("function_configs")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut seen: std::collections::HashMap<String, ()> = std::collections::HashMap::new();
+        let mut out: Vec<crate::registry::ModelInfo> = Vec::new();
+        for g in groups {
+            let func = g.get("function").and_then(Value::as_str).unwrap_or("");
+            if !TRAE_CHANNELS.contains(&func) {
+                continue; // 非白名单通道整组丢弃（发出去必被拒：4023/4001/3003）
+            }
+            for item in g.get("config_info_list").and_then(Value::as_array).cloned().unwrap_or_default() {
+                let usage_ok = item.get("usage").and_then(Value::as_str) == Some("chat_completion");
+                let switch_ok = item.get("config_switch").and_then(Value::as_bool) != Some(false);
+                let visible_ok = item.get("is_invisible_to_user").and_then(Value::as_bool) != Some(true);
+                let Some(name) = item.get("config_name").and_then(Value::as_str).filter(|n| !n.is_empty()) else { continue };
+                if !usage_ok || !switch_ok || !visible_ok {
+                    continue;
+                }
+                if seen.insert(name.to_string(), ()).is_none() {
+                    out.push(crate::registry::ModelInfo { id: name.to_string() });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 签到状态：{checked_in, credits, streak_days}。
+    pub async fn checkin_status(&self, cred: &Credential) -> Result<CheckinOutcome, ProviderError> {
+        let v = self.ug_post(cred, CHECKIN_STATUS_PATH).await?;
+        Ok(CheckinOutcome {
+            checked_in: v.get("checked_in").and_then(Value::as_bool).unwrap_or(false),
+            credits: v.get("credits").and_then(Value::as_u64),
+            streak_days: v.get("streak_days").and_then(Value::as_u64),
+        })
+    }
+
+    /// 签到领取：claim 响应只有 {"code":0} **不含积分数**——须补查
+    /// status 取真实 credits/streak_days。9074（人数过多，code 可为字符串）
+    /// 冷却 300s **不换设备**。
+    pub async fn checkin_claim(&self, cred: &Credential) -> Result<CheckinOutcome, ProviderError> {
+        let v = self.ug_post(cred, CHECKIN_CLAIM_PATH).await?;
+        // code 兼容数字与字符串两种形态
+        let code = match v.get("code") {
+            Some(Value::Number(n)) => n.as_i64(),
+            Some(Value::String(s)) => s.parse::<i64>().ok(),
+            _ => None,
+        };
+        match code {
+            Some(0) => {}
+            Some(9074) => {
+                return Err(ProviderError::RateLimited {
+                    retry_after_secs: Some(300),
+                    msg: "checkin too many people (9074)：不换设备，冷却后重试".into(),
+                });
+            }
+            Some(other) => {
+                return Err(ProviderError::Upstream(format!("checkin code {other}")));
+            }
+            None => {}
+        }
+        // 幂等补查（claim 已签返回 code:0；真实数值在 status）
+        self.checkin_status(cred).await
+    }
+
+    async fn ug_post(&self, cred: &Credential, path: &str) -> Result<Value, ProviderError> {
+        let resp = self
+            .client
+            .post(format!("{}{}", self.api_base, path))
+            .headers(self.checkin_headers(cred)?)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        if status != 200 {
+            return Err(ProviderError::Upstream(format!("ug http {status}")));
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| ProviderError::Upstream(format!("ug 响应非 JSON: {e}")))
+    }
+}
+
