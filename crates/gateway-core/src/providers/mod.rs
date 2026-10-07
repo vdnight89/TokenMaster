@@ -8,8 +8,11 @@ pub mod commandcode;
 pub mod trae;
 pub mod gemini;
 pub mod lobsterai;
+pub mod loomy;
 pub mod minimax;
 pub mod qoder;
+pub mod raccoon;
+pub mod opencode;
 pub mod qodercn;
 pub mod workbuddy;
 #[cfg(feature = "wasm")]

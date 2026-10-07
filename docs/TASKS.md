@@ -62,9 +62,9 @@
 | T4.10 | workbuddy：复用 buddy，换 workbuddy.ai 配置 | 2 | done(2 测：常量差异/复用 buddy) | T4.9 |
 | T4.11 | lobsterai：本地回调 OAuth、OpenAI 兼容、积分作废预警 | 2 | done(5 测：stream 恒 true/无腾讯头/余额 profile-summary/续期身份字段/终态 40100) | M1, M2 |
 | T4.12 | codearts：IAM OAuth+PKCE、SDK-HMAC-SHA256 签名、积分签到 | 2 | done(4 测：HMAC 七段式/确定性/429 锚定不命中 4291/排队 vs 额度) | M1, M2 |
-| T4.13 | loomy：短信/微信扫码、HMAC-SHA1、无刷新（只探测） | 2 | todo | M1, M2 |
-| T4.14 | raccoon：扫码+短信本地页、refresh 轮换、10MB 限制 | 2 | todo | M1, M2 |
-| T4.15 | opencode：账号槽+匿名槽、免费全槽、每账号代理、projectId 指纹 | 2 | todo | M1, M2 |
+| T4.13 | loomy：短信/微信扫码、HMAC-SHA1、无刷新（只探测） | 2 | done(5 测：两套头 Bearer vs token:/两池余额/first-login 幂等/探测/无 refresh) | M1, M2 |
+| T4.14 | raccoon：扫码+短信本地页、refresh 轮换、10MB 限制 | 2 | done(2 测：grant 需 X-Client-Platform desktop-*/推理) | M1, M2 |
+| T4.15 | opencode：账号槽+匿名槽、免费全槽、每账号代理、projectId 指纹 | 2 | done(6 测：五头无指纹/session id 形状/project sha1/错误按类型名) | M1, M2 |
 | T4.16 | zcode 订阅双通道（用户关注）：coding-plan 三步现换 key（getCustomerInfo→api_keys 只 GET 不建→copy secret）、通道模型归属（start-plan 优先）、429+1005/1113 换腿一次（401/3012/3009 不换）、登录顺手换 key 失败吞掉、凭据 JSON 形态 | 2 | done(双参考互证：harness transport/auth + zcode-pool oauth.rs；差异点：zcode-pool 缺 key 会 POST 创建，保守对齐 harness 只读) | T4.1 |
 | T4.17 | gemini 信封补全（对照源码）：thinkingConfig(thinkingBudget 档位)/toolConfig/maxOutputTokens 64000/tools 带 description+schema 白名单清洗/userAgent 短串 antigravity/requestId 形态/functionResponse 用 content 键/usage 缓存口径 input=prompt−cached+多帧取最大/thoughtSignature 只取 functionCall part+键 sha256 前16+512 截断/lane=infer|smoke | 2 | done(thinkingConfig 档位预算/toolConfig/maxOutputTokens 64000/schema 白名单清洗 21 键+enum 纯字符串/userAgent 短串/requestId 形态/functionResponse content 键/usage 互斥口径/thoughtSignature 键 sha256 前16+512 截断+trim/lane=infer·FNV-1a 有符号十进制) | T4.2 |
 | T4.18 | commandcode 健壮性：idle 超时(流30s/非流90s→429+Retry-After 5)、首字节前重试(max2 退避400ms×n、已写字节绝不重试)、session per-key、cache_control/prompt_cache_key 断点透传、error 状态采纳链收紧 ^<(\d{3})> | 2 | done(采纳链收紧 ^<NNN>/session per-key+prompt_cache_key 采信/cache_control 断点透传+ephemeral 补丁/读超时→429 retry5(缓冲架构总超时近似 idle)/首字节前重试 max2 退避400ms×n·超时不重试) | T4.3 |
