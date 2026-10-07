@@ -389,6 +389,8 @@ pub struct CommandcodeProvider {
     client: reqwest::Client,
     /// sessionId（UUID 形态）+ 过期时刻；12h + rand(0..1h)。
     session: std::sync::Mutex<Option<(String, u64)>>,
+    /// per-key 上报节奏：account_id → next_init_at（成功后 8h+rand(0..2h)）。
+    init_state: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl CommandcodeProvider {
@@ -397,6 +399,7 @@ impl CommandcodeProvider {
             base,
             client: reqwest::Client::new(),
             session: std::sync::Mutex::new(None),
+            init_state: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -504,6 +507,7 @@ impl CommandcodeProvider {
                 cred.secret.chars().take(6).collect::<String>()
             )));
         }
+        self.ensure_initialized(cred).await;
         let session_id = self.ensure_session();
         let body = self.build_cc_request(&session_id, route, req);
         let traceparent = format!(
@@ -537,6 +541,129 @@ impl CommandcodeProvider {
             .map_err(|e| ProviderError::Upstream(e.to_string()))?
             .to_vec();
         Ok((status, bytes))
+    }
+
+    /// 初始化上报头（generate 头的子集：无 UA/slug/session/traceparent）。
+    fn init_headers(cred: &Credential) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        let ins = reqwest::header::HeaderValue::from_str;
+        let _ = ins("production").map(|v| h.insert("x-cli-environment", v));
+        let _ = ins(CC_VERSION).map(|v| h.insert("x-command-code-version", v));
+        let _ = ins(&format!("Bearer {}", cred.secret)).map(|v| h.insert("authorization", v));
+        h
+    }
+
+    /// 设备指纹上报：thumbmark + components（逐信号哈希，空值省略键）。
+    async fn report_fingerprint(&self, cred: &Credential) -> Result<(), ProviderError> {
+        let profile = derive_device_profile(&cred.secret, "");
+        let mut components = Map::new();
+        for (k, v) in [
+            ("machineId", Some(profile.machine_id.clone())),
+            ("macs", Some(profile.macs.join(","))),
+            ("hostname", Some(profile.hostname.clone())),
+            ("cpuModel", Some(profile.cpu_model.clone())),
+            ("memoryGb", Some(profile.memory_gb.to_string())),
+            ("timezone", Some(profile.timezone.clone())),
+            ("osUser", Some(profile.os_user.clone())),
+            ("gitEmail", Some(profile.git_email.clone())),
+        ] {
+            if let Some(hv) = v.as_deref().and_then(fingerprint_hash) {
+                components.insert(k.into(), Value::String(hv));
+            }
+        }
+        let body = serde_json::json!({
+            "thumbmark": thumbmark(&profile.machine_id, &profile.macs, &profile.hostname, &profile.cpu_model),
+            "components": Value::Object(components),
+        });
+        let resp = self
+            .client
+            .post(format!("{}{}", self.base, "/alpha/fingerprint/record"))
+            .headers(Self::init_headers(cred))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(ProviderError::Upstream(format!("fingerprint record {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// 生命周期上报：cli_session_exists（metadata 的 mode 是 cliSessionMode
+    /// 枚举 interactive/non-interactive，与信封顶层 mode 不同——坑 2）。
+    async fn report_lifecycle(&self, cred: &Credential) -> Result<(), ProviderError> {
+        let body = serde_json::json!({
+            "eventType": "cli_session_exists",
+            "metadata": {
+                "sessionId": format!("sess_{}", crate::key::random_id(8)),
+                "cliVersion": CC_VERSION,
+                "mode": "interactive",
+                "os": "win32-x64",
+            }
+        });
+        let resp = self
+            .client
+            .post(format!("{}{}", self.base, "/alpha/lifecycle-events"))
+            .headers(Self::init_headers(cred))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(ProviderError::Upstream(format!("lifecycle events {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// 首次请求前并行上报指纹+生命周期；各自失败仅告警不阻塞主请求，
+    /// 成功后 8h + rand(0..2h) 内不再上报（失败下次重试）。
+    async fn ensure_initialized(&self, cred: &Credential) {
+        let now = now_ts_secs();
+        {
+            let m = self.init_state.lock().unwrap();
+            if let Some(next) = m.get(&cred.account_id) {
+                if now < *next {
+                    return;
+                }
+            }
+        }
+        let (a, b) = tokio::join!(self.report_fingerprint(cred), self.report_lifecycle(cred));
+        if a.is_ok() && b.is_ok() {
+            let next = now + 8 * 3600 + rand::Rng::random_range(&mut rand::rng(), 0..7200);
+            self.init_state.lock().unwrap().insert(cred.account_id.clone(), next);
+        }
+    }
+
+    /// `/provider/v1/models` 动态目录（§4.5）：头为初始化子集（不带 zdr），
+    /// 10s 超时；`data.data[].id` 映射为目录项。失败显式报错，
+    /// 调用方回退 `catalog()` 静态表（硬编码清单手册未载明，仅缺省模型）。
+    pub async fn fetch_models(&self, cred: &Credential) -> Result<Vec<ModelInfo>, ProviderError> {
+        let resp = self
+            .client
+            .get(format!("{}{}", self.base, "/provider/v1/models"))
+            .headers(Self::init_headers(cred))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        if status != 200 {
+            return Err(ProviderError::Upstream(format!("models {status}")));
+        }
+        let v: Value = serde_json::from_slice(&bytes)
+            .map_err(|e| ProviderError::Upstream(format!("models 响应非 JSON: {e}")))?;
+        let models = v
+            .pointer("/data/data")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(Value::as_str))
+                    .map(|id| ModelInfo { id: id.to_string() })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(models)
     }
 
     /// NDJSON 聚合 + 终态校验（零输出/无 finish），complete 与 stream 共用。
@@ -628,5 +755,162 @@ impl Provider for CommandcodeProvider {
         }
         queue.push_back(Ok(StreamChunk::Finish { reason, usage }));
         Ok(Box::pin(futures::stream::iter(queue)))
+    }
+}
+
+// ───────────────────────── 设备指纹（§4.3，T4.3b） ─────────────────────────
+
+pub const FP_SALT: &str = "command-code:device-fingerprint:v1";
+
+fn sha256_hex(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p.as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// 哈希层（CLI 逐字对齐）：`sha256_hex(FP_SALT ‖ "\0" ‖ lower(trim(v)))`；
+/// 空值返回 None（JSON 序列化时省略键）。
+pub fn fingerprint_hash(v: &str) -> Option<String> {
+    let t = v.trim().to_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    Some(sha256_hex(&[FP_SALT, "\0", &t]))
+}
+
+/// thumbmark：`sha256_hex(FP_SALT ‖ "\0machine\0" ‖ join('|', parts))`；
+/// parts = [machineId, macs.join(','), (machineId 空才带) hostname/cpu]，
+/// 空 parts 以 'unknown' 兜底。
+pub fn thumbmark(machine_id: &str, macs: &[String], hostname: &str, cpu_model: &str) -> String {
+    let mut parts: Vec<String> = vec![machine_id.to_string()];
+    if !macs.is_empty() {
+        parts.push(macs.join(","));
+    }
+    if machine_id.is_empty() {
+        parts.push(hostname.to_string());
+        parts.push(cpu_model.to_string());
+    }
+    parts.retain(|p| !p.is_empty());
+    let joined = if parts.is_empty() { "unknown".to_string() } else { parts.join("|") };
+    sha256_hex(&[FP_SALT, "\0machine\0", &joined])
+}
+
+/// 派生层 digest：`sha256(salt ‖ "\0" ‖ apiKey ‖ "\0" ‖ field)`。
+/// salt 只影响"伪造出哪台机器"，不影响哈希层（坑 28）。
+fn fp_digest(salt: &str, api_key: &str, field: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(salt.as_bytes());
+    h.update([0u8]);
+    h.update(api_key.as_bytes());
+    h.update([0u8]);
+    h.update(field.as_bytes());
+    h.finalize().to_vec()
+}
+
+// 候选池：内存与 MAC 数逐字来自手册；CPU/时区/用户名/邮箱域手册只给数量与
+// 特征（源码行 69–108），具体值未逐字载明——先放特征相符的占位集，
+// 拿到原文后逐字替换（选择机制与确定性不受池内容影响）。
+const CPU_POOL: [&str; 15] = [
+    "12th Gen Intel(R) Core(TM) i5-12400 (12 cores)",
+    "12th Gen Intel(R) Core(TM) i7-12700 (20 cores)",
+    "12th Gen Intel(R) Core(TM) i9-12900K (24 cores)",
+    "13th Gen Intel(R) Core(TM) i5-13400 (16 cores)",
+    "13th Gen Intel(R) Core(TM) i7-13700 (24 cores)",
+    "13th Gen Intel(R) Core(TM) i9-13900K (32 cores)",
+    "Intel(R) Core(TM) Ultra 5 125H (18 cores)",
+    "Intel(R) Core(TM) Ultra 7 155H (22 cores)",
+    "Intel(R) Core(TM) Ultra 9 185H (24 cores)",
+    "AMD Ryzen 5 5600X (12 cores)",
+    "AMD Ryzen 5 7600X (12 cores)",
+    "AMD Ryzen 7 5800X (16 cores)",
+    "AMD Ryzen 7 7700X (16 cores)",
+    "AMD Ryzen 9 5900X (24 cores)",
+    "AMD Ryzen 9 7950X (32 cores)",
+];
+const MEMORY_POOL: [u32; 6] = [8, 16, 24, 32, 48, 64];
+const TIMEZONE_POOL: [&str; 15] = [
+    "Asia/Shanghai", "Asia/Tokyo", "Asia/Singapore", "Asia/Hong_Kong", "Asia/Seoul",
+    "Europe/London", "Europe/Berlin", "Europe/Paris", "Europe/Moscow",
+    "America/New_York", "America/Chicago", "America/Los_Angeles", "America/Sao_Paulo",
+    "Australia/Sydney", "UTC",
+];
+const MAC_COUNT_POOL: [u32; 4] = [2, 3, 4, 5];
+const OSUSER_POOL: [&str; 6] = ["dev", "alex", "sam", "jordan", "taylor", "casey"];
+const MAIL_DOMAIN_POOL: [&str; 4] = ["gmail.com", "outlook.com", "yahoo.com", "proton.me"];
+
+/// 伪造的设备档案：全部由 apiKey 确定性派生（坑 28：换指纹本身是可疑信号）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceProfile {
+    pub machine_id: String,
+    pub macs: Vec<String>,
+    pub hostname: String,
+    pub cpu_model: String,
+    pub memory_gb: u32,
+    pub timezone: String,
+    pub os_user: String,
+    pub git_email: String,
+}
+
+fn hex_uuid(bytes: &[u8]) -> String {
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+}
+
+/// 派生一台"机器"。候选池选择按 `fpDigest(apiKey, field‖"\0"‖label)` 的
+/// digest **字节序取最大**（往池里加候选只影响恰好胜出的 key，不会全体换设备）。
+pub fn derive_device_profile(api_key: &str, salt: &str) -> DeviceProfile {
+    let pick = |field: &str, pool: &[&str]| -> String {
+        pool.iter()
+            .map(|c| (fp_digest(salt, api_key, &format!("{field}\0{c}")).to_vec(), *c))
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, c)| c.to_string())
+            .unwrap_or_default()
+    };
+    let pick_u32 = |field: &str, pool: &[u32]| -> u32 {
+        pool.iter()
+            .map(|c| (fp_digest(salt, api_key, &format!("{field}\0{c}")).to_vec(), *c))
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, c)| c)
+            .unwrap_or(pool[0])
+    };
+    let machine_id = hex_uuid(&fp_digest(salt, api_key, "machineId")[..16]);
+    let mac_count = pick_u32("macCount", &MAC_COUNT_POOL) as usize;
+    let mut macs: Vec<String> = (0..mac_count)
+        .map(|i| {
+            fp_digest(salt, api_key, &format!("mac{i}"))[..6]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(":")
+        })
+        .collect();
+    macs.sort();
+    macs.dedup();
+    let hostname = format!(
+        "DESKTOP-{}",
+        fp_digest(salt, api_key, "hostname")[..4]
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<String>()
+    );
+    let os_user = pick("osUser", &OSUSER_POOL);
+    let domain = pick("mailDomain", &MAIL_DOMAIN_POOL);
+    let email_hex: String = fp_digest(salt, api_key, "gitEmail")[..3]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    DeviceProfile {
+        machine_id,
+        macs,
+        hostname,
+        cpu_model: pick("cpuModel", &CPU_POOL),
+        memory_gb: pick_u32("memoryGb", &MEMORY_POOL),
+        timezone: pick("timezone", &TIMEZONE_POOL),
+        git_email: format!("{os_user}.{email_hex}@{domain}"),
+        os_user,
     }
 }
