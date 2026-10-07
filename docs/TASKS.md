@@ -59,9 +59,9 @@
 | T4.7 | cline：WorkOS 设备码、`workos:` Bearer 前缀、OpenAI 兼容 | 2 | done(6 测：workos 前缀头/三分类限流/免费模型/人类可读时长) | M1, M2 |
 | T4.8 | minimax：设备码+PKCE、Anthropic Messages 协议、refresh 轮换 | 2 | done(5 测：pending=200/签到 query/余额字符串挡空/头无 anthropic-version) | M1, M2 |
 | T4.9 | buddy：external-link 轮询、X-Domain、余额临期分档 | 2 | done(7 测：X-Domain ||/11140 三通道/登录轮询/refresh 头/余额双层) | M1, M2 |
-| T4.10 | workbuddy：复用 buddy，换 workbuddy.ai 配置 | 2 | todo | T4.9 |
-| T4.11 | lobsterai：本地回调 OAuth、OpenAI 兼容、积分作废预警 | 2 | todo | M1, M2 |
-| T4.12 | codearts：IAM OAuth+PKCE、SDK-HMAC-SHA256 签名、积分签到 | 2 | todo | M1, M2 |
+| T4.10 | workbuddy：复用 buddy，换 workbuddy.ai 配置 | 2 | done(2 测：常量差异/复用 buddy) | T4.9 |
+| T4.11 | lobsterai：本地回调 OAuth、OpenAI 兼容、积分作废预警 | 2 | done(5 测：stream 恒 true/无腾讯头/余额 profile-summary/续期身份字段/终态 40100) | M1, M2 |
+| T4.12 | codearts：IAM OAuth+PKCE、SDK-HMAC-SHA256 签名、积分签到 | 2 | done(4 测：HMAC 七段式/确定性/429 锚定不命中 4291/排队 vs 额度) | M1, M2 |
 | T4.13 | loomy：短信/微信扫码、HMAC-SHA1、无刷新（只探测） | 2 | todo | M1, M2 |
 | T4.14 | raccoon：扫码+短信本地页、refresh 轮换、10MB 限制 | 2 | todo | M1, M2 |
 | T4.15 | opencode：账号槽+匿名槽、免费全槽、每账号代理、projectId 指纹 | 2 | todo | M1, M2 |

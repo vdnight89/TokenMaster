@@ -3,12 +3,15 @@
 
 pub mod buddy;
 pub mod cline;
+pub mod codearts;
 pub mod commandcode;
 pub mod trae;
 pub mod gemini;
+pub mod lobsterai;
 pub mod minimax;
 pub mod qoder;
 pub mod qodercn;
+pub mod workbuddy;
 #[cfg(feature = "wasm")]
 pub mod qoder_wasm;
 pub mod zcode;
