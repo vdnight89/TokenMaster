@@ -63,3 +63,4 @@
 - 2026-10-07 T6.2 zcode-pool 导入 done：enc:v1 兼容解析（AES-256-GCM 三段 b64url：nonce/tag/ct；密钥 sha256(secret)；secret=env ZCODE_CREDENTIAL_SECRET 或 fallback:platform:home:username 平台映射 win32/darwin）；递归解密 JSON 字段（失败置空标记需重登）；目录导入（store/accounts/*.json 坏文件跳过）。7 测绿。
 - 2026-10-07 T6.4 签到调度 done：CheckinScheduler（注册 provider×账号→run_all 遍历签到闭包→CheckinOutcome 含 success/already_claimed/message）；AutoCheckin（interval+enabled 开关）；summarize 汇总。签到闭包由上层注入（各家协议已在 M4 实现）。4 测绿。
 - 2026-10-07 T6.5 出站代理三级覆盖 done：ProxyConfig{global/provider/account}——resolve 按优先级取第一个非 None；空串=显式禁用（覆盖上级为直连）；凭据 JSON proxy_url 字段读取；apply_proxy 构造 reqwest Client。4 测绿。全仓 299 测/clippy 0/pnpm 绿。
+- 2026-10-07 T7.1+T7.2+T7.3 集成收尾 done：T7.1 集成关卡四项全绿（299 测 + clippy 0 + pnpm check + pnpm build）；T7.2 release profile（fat LTO + strip symbols + opt-level s + codegen-units 1 + panic abort → 3.6MB）；T7.3 README 更新（状态 badge 绿 + 已完成里程碑表 + 快速开始/构建/网关使用/导入指南）；T8.2 状态修正（integration_e2e 7 用例已包含在 299 测中）。

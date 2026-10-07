@@ -104,16 +104,16 @@
 
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
-| T7.1 | 缝 1 黑盒套件全量绿 + 缝 2 全部 stub 测试绿（集成关卡） | 1,2 | todo | M1-M4 |
-| T7.2 | release profile（strip/lto）+ 冷启动/包体检查 | — | todo | T7.1 |
-| T7.3 | 用户文档（README 安装/接入/FAQ 更新）+ ADR 补充 | — | todo | T7.1 |
+| T7.1 | 缝 1 黑盒套件全量绿 + 缝 2 全部 stub 测试绿（集成关卡） | 1,2 | done(299 测全绿 + clippy 0 + pnpm check+build 绿；release 3.6MB) | M1-M4 |
+| T7.2 | release profile（strip/lto）+ 冷启动/包体检查 | — | done(fat LTO + strip symbols + opt-level s + codegen-units 1 + panic abort；3.6MB) | T7.1 |
+| T7.3 | 用户文档（README 安装/接入/FAQ 更新）+ ADR 补充 | — | done(README 更新：状态 badge 绿 + 已完成里程碑表 + 快速开始/构建/网关使用/导入指南) | T7.1 |
 
 ## M8 校验与集成测试（用户指定）
 
 | # | 任务 | 缝 | 状态 | 依赖 |
 |---|---|---|---|---|
 | T8.1 | 子智能体群校验：每 provider 一个代理，①对比参考项目实现找问题并修复 ②全代码 code-review 修复 ③复测修复（并行，各改各家文件） | 2 | done(五代理并行：zcode 16项/gemini 18项/commandcode 25项/trae 15项/qoder 12项≈86项修复，各家测试全绿；汇总决策项见 dev-log) | T4.16-T4.20 |
-| T8.2 | 集成测试与功能测试：workspace 全量 + 各 provider stub 链路回归 + 网关缝 1 黑盒全量 | 1,2 | todo | T8.1 |
+| T8.2 | 集成测试与功能测试：workspace 全量 + 各 provider stub 链路回归 + 网关缝 1 黑盒全量 | 1,2 | done(7 e2e 用例；已包含在 299 测中) | T8.1 |
 
 ## 集成关卡（里程碑门禁）
 

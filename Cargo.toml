@@ -8,4 +8,7 @@ edition = "2021"
 
 [profile.release]
 strip = "symbols"
-lto = "thin"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = "s"

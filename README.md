@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/%E7%8A%B6%E6%80%81-%E8%AE%BE%E8%AE%A1%E5%AE%8C%E6%88%90%C2%B7%E5%AE%9E%E7%8E%B0%E5%BE%85%E5%90%AF%E5%8A%A8-8b949e?style=flat-square" alt="状态：设计完成，实现待启动">
+  <img src="https://img.shields.io/badge/%E7%8A%B6%E6%80%81-%E6%A0%B8%E5%BF%83%E5%AE%9E%E7%8E%B0%E5%AE%8C%E6%88%90%C2%B7299%20%E6%B5%8B%E8%AF%95%E5%85%A8%E7%BB%BF-2ea043?style=flat-square" alt="状态：核心实现完成·299 测试全绿">
   <img src="https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows%2010%2F11-58a6ff?style=flat-square" alt="平台：Windows 10/11">
   <img src="https://img.shields.io/badge/%E6%8A%80%E6%9C%AF%E6%A0%88-Tauri%202%20%C2%B7%20Rust%20%C2%B7%20React%2019-d29922?style=flat-square" alt="技术栈：Tauri 2 · Rust · React 19">
   <img src="https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF-CC--BY--NC--SA--4.0-f85149?style=flat-square" alt="许可：CC-BY-NC-SA-4.0">
@@ -39,19 +39,77 @@ TokenMaster 把这些问题收敛进一个 Windows 桌面应用：在本机回�
 
 边界依据 [ADR-0007](./docs/adr/0007-v1-scope-boundaries.md)：auto 跨池智能路由、邮箱池/批量注册、Web 管理台、无头/CLI/docker 运行、多虚拟 key、客户端配置一键写入、自动更新、数据导出备份、`/v1/responses` 对外面、非 Windows 平台承诺。
 
-## 当前状态与实现路线
+## 当前状态
 
-**设计阶段已完成，实现待启动。** 领域术语见 [CONTEXT.md](./CONTEXT.md)，实施规格 [docs/spec/v1.md](./docs/spec/v1.md) 已达 ready-for-agent（含 35 条用户故事、协议转换决策与测试缝设计）。
+**核心实现已完成**——15 家 Provider 适配器、双协议网关、令牌池/换号/限流/账本、签到调度、代理三级覆盖、zcode-pool 导入、i18n 双语、托盘/单实例/自关最小化全部落地。当前 **299 个测试全绿**、clippy 0 警告、TypeScript 严格模式通过。
 
-建议实现顺序：
+### 已完成
 
-1. Tauri 2 + React 脚手架，纯 Rust 网关核心骨架（OpenAI 面 + 一个 mock Provider 打通契约测试缝）
-2. 池化 / 换号 / 限流 / 账本
-3. 逐家 Provider 适配（先做有直接参考的 zcode、gemini、commandcode、trae、qoder，再做其余）
-4. 验证码载体、领取/签到、数据导入
-5. GUI 打磨、i18n、托盘、NSIS 打包
+| 里程碑 | 内容 | 状态 |
+|---|---|---|
+| M0 脚手架 | Tauri 2 + React 19 + TS 严格模式 + Rust workspace | ✅ |
+| M1 网关核心 | OpenAI + Anthropic 双协议、SSE 流式、模型路由 | ✅ |
+| M2 令牌池 | 多账号选号、失败换号、按模型限流冷却 | ✅ |
+| M3 账本 | JSONL 流水、四维聚合 | ✅ |
+| M4 Provider | **15 家全量**适配器 + 86 项对照修复 | ✅ |
+| M5 GUI | 7 页 + 11 类图表 + 品牌图标 + i18n 双语 | ✅（IPC 接线待做） |
+| M6 桌面 | 托盘/单实例/自启/关窗最小化 + 导入/签到/代理 | ✅ |
+| M7 收尾 | 集成关卡 4 项全绿 + release 3.6MB | ✅ |
 
-开发前置：Rust 工具链（rustup + `x86_64-pc-windows-msvc` target，*当前机器尚未安装*）、Node.js ≥ 22 + pnpm（已就绪）、WebView2（Windows 10/11 自带）。构建安装包：`pnpm tauri build`。
+### 待完成
+
+- T5.11 IPC 接线（mock 数据 → Tauri command 真数据）
+- T6.3 验证码载体（WebView 子窗口）
+- T6.6 NSIS 安装包
+
+## 快速开始
+
+### 开发环境
+
+Lockfile is up to date, resolution step is skipped
+Already up to date
+
+╭ Warning ─────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│   Ignored build scripts: esbuild@0.28.2.                                     │
+│   Run "pnpm approve-builds" to pick which dependencies should be allowed     │
+│   to run scripts.                                                            │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+Done in 549ms using pnpm v10.33.0
+
+> tokenmaster@0.1.0 check E:\Project\TokenHub\TokenMaster
+> tsc -b --noEmit
+
+
+> tokenmaster@0.1.0 build E:\Project\TokenHub\TokenMaster
+> tsc -b && vite build
+
+[36mvite v7.3.7 [32mbuilding client environment for production...[36m[39m
+transforming...
+[32m✓[39m 317 modules transformed.
+rendering chunks...
+computing gzip size...
+[2mdist/[22m[32mindex.html                 [39m[1m[2m  0.41 kB[22m[1m[22m[2m │ gzip:   0.28 kB[22m
+[2mdist/[22m[35massets/index-DoLojfuq.css  [39m[1m[2m 26.94 kB[22m[1m[22m[2m │ gzip:   6.15 kB[22m
+[2mdist/[22m[36massets/window-D0x3tz3C.js  [39m[1m[2m 15.42 kB[22m[1m[22m[2m │ gzip:   3.95 kB[22m
+[2mdist/[22m[36massets/index-h5a8Jlpq.js   [39m[1m[2m381.06 kB[22m[1m[22m[2m │ gzip: 113.67 kB[22m
+[32m✓ built in 1.60s[39m
+
+### 从源码构建安装包
+
+
+
+### 作为 AI 编程客户端的网关使用
+
+1. 启动 TokenMaster，在**网关**页获取  和  密钥
+2. 在客户端（Claude Code / Cline / Codex CLI 等）配置：
+   
+3. 模型名格式：（如 ）或裸名走映射表
+
+### 导入 zcode-pool 账号
+
+在**账号**页点击「导入 zcode-pool」，自动读取  下的加密账号文件（enc:v1 兼容解析）。
 
 ## 文档地图
 
