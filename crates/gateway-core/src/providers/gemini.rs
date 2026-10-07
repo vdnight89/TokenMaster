@@ -230,7 +230,9 @@ impl GeminiProvider {
     fn identity_headers(&self, cred: &Credential) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
         let ins = reqwest::header::HeaderValue::from_str;
-        let _ = ins(&format!("Bearer {}", cred.secret)).map(|v| h.insert("authorization", v));
+        // JSON 凭据取 access_token；裸串回退兼容
+        let (at, _) = parse_secret(&cred.secret);
+        let _ = ins(&format!("Bearer {at}")).map(|v| h.insert("authorization", v));
         let _ = ins(CLIENT_UA).map(|v| h.insert("user-agent", v));
         let _ = ins("antigravity").map(|v| h.insert("x-client-name", v));
         let _ = ins("4.3.0").map(|v| h.insert("x-client-version", v));
@@ -605,6 +607,10 @@ impl Provider for GeminiProvider {
         "gemini"
     }
 
+    async fn refresh(&self, cred: &Credential) -> Result<Credential, ProviderError> {
+        GeminiOAuth::production().refresh(cred).await
+    }
+
     fn catalog(&self) -> ProviderCatalog {
         ProviderCatalog {
             id: "gemini".into(),
@@ -685,5 +691,204 @@ impl Provider for GeminiProvider {
         let reason = if saw_tool_call { "tool_calls" } else { "stop" };
         queue.push_back(Ok(StreamChunk::Finish { reason: reason.into(), usage }));
         Ok(Box::pin(futures::stream::iter(queue)))
+    }
+}
+
+/// Gemini OAuth（§4.14）：授权 `accounts.google.com/o/oauth2/v2/auth` +
+/// token `oauth2.googleapis.com/token`；**refresh_token 会轮换，刷新后必须
+/// 立即回写**（响应未带新 rt 时保留旧值）。
+///
+/// 凭据 secret 形态：JSON `{access_token, refresh_token, expires_at}`；
+/// 推理 Authorization 取其中 access_token（裸串回退兼容）。
+///
+/// ⚠️ 生产默认值待确认（手册未载明）：client 的公开 client_id 具体值（参考
+/// 实现经 env `CMDC_PAK_GOOGLE_CLIENT_ID` 可覆盖）与六项 scope 逐字清单
+/// （`cloud-platform`+`cclog`+`experimentsandconfigs` 等）。
+#[derive(Clone)]
+pub struct GeminiOAuth {
+    auth_url: String,
+    token_url: String,
+    client_id: String,
+    scopes: Vec<String>,
+    client: reqwest::Client,
+}
+
+/// 解析凭据 secret：JSON 形态取 (access_token, Some(refresh_token))；
+/// 非 JSON 按裸 access_token 回退（历史/手工凭据兼容）。
+pub(crate) fn parse_secret(secret: &str) -> (String, Option<String>) {
+    if let Ok(v) = serde_json::from_str::<Value>(secret) {
+        if let Some(at) = v.get("access_token").and_then(Value::as_str) {
+            let rt = v.get("refresh_token").and_then(Value::as_str).map(str::to_string);
+            return (at.to_string(), rt);
+        }
+    }
+    (secret.to_string(), None)
+}
+
+fn form_enc(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn now_ts_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl GeminiOAuth {
+    pub fn new(auth_url: String, token_url: String, client_id: String, scopes: Vec<String>) -> Self {
+        Self { auth_url, token_url, client_id, scopes, client: reqwest::Client::new() }
+    }
+
+    /// 生产配置：Google 固定端点；client_id 经 `CMDC_PAK_GOOGLE_CLIENT_ID`
+    /// 注入（未配置时 refresh 会被上游以凭据错误拒绝）。
+    pub fn production() -> Self {
+        Self::new(
+            "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            "https://oauth2.googleapis.com/token".into(),
+            std::env::var("CMDC_PAK_GOOGLE_CLIENT_ID").unwrap_or_default(),
+            Vec::new(), // 六项 scope 逐字清单待用户提供（见类型文档）
+        )
+    }
+
+    /// 授权 URL（response_type=code + access_type=offline 换 refresh_token；
+    /// prompt=consent 保证离线授权下发）。
+    pub fn login_url(&self, redirect_uri: &str, state: &str) -> String {
+        format!(
+            "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&access_type=offline&prompt=consent",
+            self.auth_url,
+            form_enc(&self.client_id),
+            form_enc(redirect_uri),
+            form_enc(&self.scopes.join(" ")),
+            form_enc(state),
+        )
+    }
+
+    async fn post_token(&self, form: &[(&str, &str)]) -> Result<Value, ProviderError> {
+        let resp = self
+            .client
+            .post(&self.token_url)
+            .form(form)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        if status != 200 {
+            return Err(ProviderError::Credential(format!(
+                "oauth token endpoint {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|e| ProviderError::Upstream(format!("token 响应非 JSON: {e}")))
+    }
+
+    fn credential_from(&self, v: &Value, fallback_rt: Option<&str>, account_id: &str) -> Result<Credential, ProviderError> {
+        let at = v
+            .get("access_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::Upstream("token 响应缺 access_token".into()))?;
+        // 轮换语义：响应带新 refresh_token 立即回写；未带保留旧值
+        let rt = v
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| fallback_rt.map(str::to_string));
+        let expires_at = now_ts_secs() + v.get("expires_in").and_then(Value::as_u64).unwrap_or(3600);
+        let secret = serde_json::json!({
+            "access_token": at,
+            "refresh_token": rt,
+            "expires_at": expires_at,
+        })
+        .to_string();
+        Ok(Credential { account_id: account_id.into(), secret })
+    }
+
+    /// 本地回环回调登录：随机端口起 listener，返回 (授权 URL, 凭据接收端)。
+    /// 浏览器完成授权后 Google 重定向到 `http://127.0.0.1:{port}?code=…&state=…`，
+    /// 校验 state（防 CSRF）→ 交换 token → oneshot 回传 Credential。
+    pub async fn start_login(
+        &self,
+    ) -> (String, tokio::sync::oneshot::Receiver<Result<Credential, ProviderError>>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind loopback callback");
+        let port = listener.local_addr().unwrap().port();
+        let redirect_uri = format!("http://127.0.0.1:{port}");
+        let state = crate::key::random_id(12);
+        let url = self.login_url(&redirect_uri, &state);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        let this = self.clone();
+        let expected_state = state.clone();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(
+                move |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| {
+                    let tx = tx.clone();
+                    let this = this.clone();
+                    let expected_state = expected_state.clone();
+                    async move {
+                        let (code, got_state) = (query.get("code"), query.get("state"));
+                        let (Some(code), Some(got_state)) = (code, got_state) else {
+                            return (axum::http::StatusCode::BAD_REQUEST, "missing code/state");
+                        };
+                        if got_state != &expected_state {
+                            return (axum::http::StatusCode::FORBIDDEN, "state mismatch");
+                        }
+                        // redirect_uri 与授权时一致（同端口）
+                        let res = this.exchange_code(code, &format!("http://127.0.0.1:{port}")).await;
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send(res);
+                        }
+                        (axum::http::StatusCode::OK, "TokenMaster: 登录完成，可关闭此页")
+                    }
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("callback serve");
+        });
+        (url, rx)
+    }
+
+    /// 授权码交换（account_id 由调用方落库时分配，此处沿用传入值）。
+    pub async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<Credential, ProviderError> {
+        let v = self
+            .post_token(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("client_id", self.client_id.as_str()),
+                ("redirect_uri", redirect_uri),
+            ])
+            .await?;
+        self.credential_from(&v, None, "")
+    }
+
+    /// 刷新：refresh_token 轮换立即回写（§4.14）。
+    pub async fn refresh(&self, cred: &Credential) -> Result<Credential, ProviderError> {
+        let (_, Some(rt)) = parse_secret(&cred.secret) else {
+            return Err(ProviderError::Credential(
+                "gemini 凭据无 refresh_token（裸串或 JSON 缺字段），需重新登录".into(),
+            ));
+        };
+        let v = self
+            .post_token(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", rt.as_str()),
+                ("client_id", self.client_id.as_str()),
+            ])
+            .await?;
+        self.credential_from(&v, Some(&rt), &cred.account_id)
     }
 }
