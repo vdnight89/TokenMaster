@@ -300,6 +300,21 @@ async fn anthropic_messages(
             .complete(&Credential::direct(), &route, &req)
             .await
             .map_err(provider_error)?;
+        // 记账（与 OpenAI 面同一口径）
+        if let Some(ledger) = &state.ledger {
+            ledger.record(crate::ledger::UsageRecord {
+                ts: now_secs(),
+                provider: route.provider.clone(),
+                account_id: "direct".into(),
+                model: route.model.clone(),
+                prompt_tokens: completion.usage.prompt_tokens,
+                completion_tokens: completion.usage.completion_tokens,
+                status: 200,
+                ttfb_ms: None,
+                duration_ms: 0,
+                proto: "anthropic",
+            });
+        }
         Ok(Json(crate::anthropic::message_from_completion(&completion)).into_response())
     }
 }
@@ -381,4 +396,11 @@ async fn auth(
     } else {
         ApiError::InvalidApiKey.into_response()
     }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

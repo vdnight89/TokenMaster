@@ -40,3 +40,32 @@ impl WorkbuddyProvider {
         &self.inner
     }
 }
+
+#[async_trait]
+impl Provider for WorkbuddyProvider {
+    fn id(&self) -> &str {
+        "workbuddy"
+    }
+
+    fn catalog(&self) -> ProviderCatalog {
+        self.inner.catalog()
+    }
+
+    async fn refresh(&self, cred: &Credential) -> Result<Credential, ProviderError> {
+        BuddyProvider::refresh(&self.inner, cred).await
+    }
+
+    async fn complete(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChatCompletion, ProviderError> {
+        self.inner.complete(cred, route, req).await
+    }
+
+    async fn stream(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChunkStream, ProviderError> {
+        self.inner.stream(cred, route, req).await
+    }
+}
+
+use async_trait::async_trait;
+use crate::openai::{ChatCompletion, ChatRequest};
+use crate::provider::{ChunkStream, Credential, Provider, ProviderError};
+use crate::registry::ProviderCatalog;
+use crate::route::Route;
