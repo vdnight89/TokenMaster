@@ -27,6 +27,9 @@ pub struct ChatMessage {
     /// `role:tool` 消息关联的调用 id（映射到 assistant `tool_calls[].id`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// assistant 消息的思考链（DeepSeek 风格历史回传；commandcode 需带回上游）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
