@@ -57,8 +57,8 @@
 | T4.5 | qoder：PKCE 设备码、WASM 请求加密(wasmtime)、信封解包、双推理路径 | 2 | done(设备码登录+refresh+信封+credits+Cosy头+推理载荷全链路；WASM桥 feature门控已通到随机数层——最后一 panic 点见 T4.20) | M1, M2 |
 | T4.6 | qodercn：复用 qoder，仅换端点/client_id | 2 | done(3 测：常量/登录/credits) | T4.5 |
 | T4.7 | cline：WorkOS 设备码、`workos:` Bearer 前缀、OpenAI 兼容 | 2 | done(6 测：workos 前缀头/三分类限流/免费模型/人类可读时长) | M1, M2 |
-| T4.8 | minimax：设备码+PKCE、Anthropic Messages 协议、refresh 轮换 | 2 | todo | M1, M2 |
-| T4.9 | buddy：external-link 轮询、X-Domain、余额临期分档 | 2 | todo | M1, M2 |
+| T4.8 | minimax：设备码+PKCE、Anthropic Messages 协议、refresh 轮换 | 2 | done(5 测：pending=200/签到 query/余额字符串挡空/头无 anthropic-version) | M1, M2 |
+| T4.9 | buddy：external-link 轮询、X-Domain、余额临期分档 | 2 | done(7 测：X-Domain ||/11140 三通道/登录轮询/refresh 头/余额双层) | M1, M2 |
 | T4.10 | workbuddy：复用 buddy，换 workbuddy.ai 配置 | 2 | todo | T4.9 |
 | T4.11 | lobsterai：本地回调 OAuth、OpenAI 兼容、积分作废预警 | 2 | todo | M1, M2 |
 | T4.12 | codearts：IAM OAuth+PKCE、SDK-HMAC-SHA256 签名、积分签到 | 2 | todo | M1, M2 |
