@@ -71,7 +71,69 @@ pub fn run() {
             let _tray = app.tray_by_id("main");
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![ping, gateway_status])
+        .invoke_handler(tauri::generate_handler![
+                ping,
+                gateway_status,
+                list_providers,
+                list_accounts,
+                gateway_config,
+                usage_summary,
+            ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ───────────── T5.11 IPC Commands ─────────────
+
+#[tauri::command]
+fn list_providers() -> Result<serde_json::Value, String> {
+    let providers = [
+        ("zcode", "ZCode", "#3b82f6", "PRO"),
+        ("gemini", "Gemini", "#10b981", "ULTRA"),
+        ("trae", "Trae", "#f97316", "PRO"),
+        ("qoder", "Qoder", "#8b5cf6", "PRO"),
+        ("qodercn", "QoderCN", "#a855f7", "PRO"),
+        ("minimax", "MiniMax", "#ec4899", "PRO"),
+        ("codearts", "CodeArts", "#0ea5e9", "PRO"),
+        ("buddy", "Buddy", "#14b8a6", "PRO"),
+        ("workbuddy", "WorkBuddy", "#84cc16", "FREE"),
+        ("lobsterai", "LobsterAI", "#ef4444", "PRO"),
+        ("cline", "Cline", "#06b6d4", "FREE"),
+        ("loomy", "Loomy", "#6366f1", "FREE"),
+        ("raccoon", "Raccoon", "#d946ef", "PRO"),
+        ("opencode", "OpenCode", "#64748b", "FREE"),
+        ("commandcode", "CommandCode", "#eab308", "PRO"),
+    ];
+    let mut map = serde_json::Map::new();
+    for (id, name, color, tier) in providers {
+        map.insert(id.to_string(), serde_json::json!({
+            "name": name, "color": color, "tier": tier
+        }));
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+#[tauri::command]
+fn list_accounts() -> Result<serde_json::Value, String> {
+    // TODO: 从 TokenPool / Store 读真数据；暂返回空（GUI 显示「暂无账号」引导添加）
+    Ok(serde_json::json!([]))
+}
+
+#[tauri::command]
+fn gateway_config() -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "port": GATEWAY_PORT,
+        "base_url": format!("http://127.0.0.1:{GATEWAY_PORT}"),
+        "protocol": "OpenAI + Anthropic",
+    }))
+}
+
+#[tauri::command]
+fn usage_summary() -> Result<serde_json::Value, String> {
+    // TODO: 从 Ledger 读真数据；暂返回空结构
+    Ok(serde_json::json!({
+        "today": { "requests": 0, "tokens": 0 },
+        "byProvider": {},
+        "byModel": {},
+    }))
 }

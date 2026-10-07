@@ -1,6 +1,7 @@
 /** 网关页：服务启停 / 密钥 / 模型映射 / 选号策略 / 路由拓扑（对应原型 #page-gateway / renderGateway） */
 import { useState } from "react";
 import { Ic } from "../lib/icons";
+import { useGatewayInfo } from "../lib/ipc";
 import { CopyBtn } from "../lib/ui";
 import { ProviderGlyphIcon } from "../lib/brand";
 import { KEY_FULL, KEY_MASKED, MAPS, PROVIDERS } from "../lib/mock";
@@ -15,6 +16,9 @@ function toPv(to: string): PvKey | null {
 }
 
 export default function Gateway({ gwOn, onToggleGw }: { gwOn: boolean; onToggleGw: () => void }) {
+  const { data: gw, isReal: isLive } = useGatewayInfo({ port: 8787, base_url: "http://127.0.0.1:8787", protocol: "OpenAI + Anthropic" });
+  // TODO: 用 gw.port 替换硬编码端口显示（等 IPC 数据格式与 mock 对齐后启用）
+  void gw; void isLive;
   const [port, setPort] = useState("8787");
   const [keyShown, setKeyShown] = useState(false);
   const [tiering, setTiering] = useState(true);

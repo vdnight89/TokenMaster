@@ -85,7 +85,7 @@
 | T5.8 | 日志页：过滤/监控表/行展开换号轨迹 | — | done(agent) | T5.1 |
 | T5.9 | 接入页 + 设置页（代理三级覆盖 UI） | — | done(agent) | T5.1 |
 | T5.10 | i18n 双语（zh/en 词条表 + t()，与 Rust 错误词表对齐） | — | done(zh/en 120+ 词条 + t()/useLang()/localStorage + Settings 切换 UI) | T5.3-T5.9 |
-| T5.11 | IPC 接线：mock 数据逐页替换为 Tauri command 真数据 | — | todo | T0.3, M1-M3, T5.3-T5.9 |
+| T5.11 | IPC 接线：mock 数据逐页替换为 Tauri command 真数据 | — | doing(ipc.ts 桥层+4 IPC commands+Dash/Gateway 已接线；Accounts/Usage/Logs/Settings 待接) | T0.3, M1-M3, T5.3-T5.9 |
 | T5.12 | Provider/模型品牌图标：优先接入 @lobehub/icons（icons.lobehub.com，先确认许可并在 README/设置页署名），替换账号卡/仪表盘池仪表/映射表/日志模型列/接入页模型表/用量图例等处的色块字母；模型按家族前缀映射（glm→Zhipu、claude→Anthropic、gemini→Google、qwen→Qwen、deepseek→DeepSeek、MiniMax、gpt→OpenAI、kimi→Moonshot）；lobehub 未收录的 provider（commandcode/lobsterai/loomy/raccoon/workbuddy/qodercn/buddy 等）联网检索官方品牌图或沿用现有彩色字母徽章兜底；图标统一走 `src/lib/brand.tsx` 单一出口，离线打包不引运行时网络资源 | — | done(agent) | T5.3-T5.9（纯前端，可与 M4 并行） |
 
 ## M6 桌面集成
@@ -98,7 +98,7 @@
 | T6.3 | 验证码载体：WebView 子窗口按需拉起 + 供应池退避 | 2 | todo | T0.3, T4.1 |
 | T6.4 | 签到调度（手动 + 可选自动轮询） | 2 | done(4 测：全遍历签到/空注册/汇总/自动轮询开关) | M4 |
 | T6.5 | 出站代理：全局→Provider→账号三级覆盖（http/socks5） | 2 | done(4 测：三级优先/空串禁用/无配置直连/凭据代理读取) | M4 |
-| T6.6 | NSIS 打包（currentUser）+ 版本一致性校验脚本 | — | todo | M5, M6 |
+| T6.6 | NSIS 打包（currentUser）+ 版本一致性校验脚本 | — | done(currentUser 安装/中英双语安装界面/displayLanguageSelector) | M5, M6 |
 
 ## M7 集成收尾
 

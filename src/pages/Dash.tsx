@@ -5,7 +5,9 @@ import { toast } from "../lib/toast";
 import { ProviderBrandIcon, ProviderGlyphIcon } from "../lib/brand";
 import type { ModalKind } from "../lib/ui";
 import type { PageKey } from "../lib/nav";
-import { ERR_SEG, LOGS, POOLS, PROVIDERS, TODOS } from "../lib/mock";
+import { ERR_SEG, LOGS, POOLS, TODOS } from "../lib/mock";
+import { useProviders } from "../lib/ipc";
+import { PROVIDERS as MOCK_PROVIDERS } from "../lib/mock";
 import type { Todo } from "../lib/mock";
 import { fmt, sum } from "../lib/fmt";
 import { Gauge } from "../charts/Gauge";
@@ -32,6 +34,7 @@ export default function Dash({
   const mx = Math.round(Math.max(...thru));
   const avg = Math.round(sum(thru) / thru.length);
   const [pending, setPending] = useState<string | null>(null);
+  const { data: PROVIDERS } = useProviders(MOCK_PROVIDERS);
   const remaining = TODOS.filter(t => !doneTodos.has(t.id)).length;
   const tot = sum(ERR_SEG.map(s => s[1]));
 
