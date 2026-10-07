@@ -695,7 +695,8 @@ impl CommandcodeProvider {
             }
         }
         let now = now_ts_secs();
-        let mut s = self.session.lock().unwrap();
+        // 锁中毒不致命（HashMap 缓存无 invariant）：恢复数据继续
+        let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((id, exp)) = s.get(&cred.account_id) {
             if now < *exp {
                 return id.clone();
@@ -988,7 +989,7 @@ impl CommandcodeProvider {
     async fn ensure_initialized(&self, cred: &Credential) {
         let now = now_ts_secs();
         {
-            let m = self.init_state.lock().unwrap();
+            let m = self.init_state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(next) = m.get(&cred.account_id) {
                 if now < *next {
                     return;
@@ -998,7 +999,7 @@ impl CommandcodeProvider {
         let _ = tokio::join!(self.report_fingerprint(cred), self.report_lifecycle(cred));
         // 用上报完成后的时刻起算（参考在 Promise.all 之后取 Date.now()）
         let next = now_ts_secs() + 8 * 3600 + rand::Rng::random_range(&mut rand::rng(), 0..7200);
-        self.init_state.lock().unwrap().insert(cred.account_id.clone(), next);
+        self.init_state.lock().unwrap_or_else(|e| e.into_inner()).insert(cred.account_id.clone(), next);
     }
 
     /// `/provider/v1/models` 动态目录（§4.5）：头为初始化子集（不带 zdr），

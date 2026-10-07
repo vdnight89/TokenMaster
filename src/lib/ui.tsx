@@ -7,6 +7,12 @@ export type ModalKind = "add" | "claim" | "import" | null;
 /** 复制按钮：点击写剪贴板并把图标换成对勾 1.2s（对应原型 bindCopy） */
 export function CopyBtn({ text, title = "复制", className = "" }: { text: string; title?: string; className?: string }) {
   const [done, setDone] = useState(false);
+  // 复位定时器挂在 effect 上：组件卸载时清理，不再向已卸载组件 setState
+  useEffect(() => {
+    if (!done) return;
+    const id = window.setTimeout(() => setDone(false), 1200);
+    return () => window.clearTimeout(id);
+  }, [done]);
   return (
     <button
       className={`ibtn${className ? " " + className : ""}`}
@@ -20,7 +26,6 @@ export function CopyBtn({ text, title = "复制", className = "" }: { text: stri
           /* 原型环境忽略 */
         }
         setDone(true);
-        window.setTimeout(() => setDone(false), 1200);
       }}
     >
       <Ic name={done ? "check" : "copy"} />

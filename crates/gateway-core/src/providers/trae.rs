@@ -329,9 +329,9 @@ impl TraeProvider {
                     return None; // credits_limit<=0 的包不计入（trae-credits.ts:356）
                 }
                 let used = pack.pointer("/usage/credits_amount").and_then(Value::as_i64).unwrap_or(0);
-                Some(limit - used)
+                Some(limit.saturating_sub(used))
             })
-            .sum();
+            .fold(0i64, i64::saturating_add);
         Ok(TraeBalance { total: total.max(0) as u64 })
     }
 }
@@ -393,7 +393,7 @@ impl TraeLoginFlow {
                     let ids = ids_for_handler.clone();
                     async move {
                         let send = |res: Result<Credential, ProviderError>| {
-                            if let Some(tx) = tx.lock().unwrap().take() {
+                            if let Some(tx) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
                                 let _ = tx.send(res);
                             }
                         };
@@ -1008,7 +1008,7 @@ impl Provider for TraeProvider {
         let cached = self
             .models_cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
             .unwrap_or_else(|| std::sync::Arc::new(vec![crate::registry::ModelInfo { id: TRAE_DEFAULT_MODEL.into() }]));
         crate::registry::ProviderCatalog { id: "trae".into(), models: (*cached).clone() }
@@ -1264,9 +1264,9 @@ impl TraeProvider {
         let expires_ms = if expire_at > 1_000_000_000_000 {
             expire_at
         } else if expire_at > 0 {
-            expire_at * 1000
+            expire_at.saturating_mul(1000)
         } else if duration > 0 {
-            now_ms + duration * 1000
+            now_ms.saturating_add(duration.saturating_mul(1000))
         } else {
             0
         };
@@ -1360,7 +1360,7 @@ impl TraeProvider {
             }
         }
         // catalog() 优先返回远端目录（参考 TraeAdapter.remoteModels 缓存）
-        *self.models_cache.lock().unwrap() = Some(std::sync::Arc::new(out.clone()));
+        *self.models_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(out.clone()));
         Ok(out)
     }
 

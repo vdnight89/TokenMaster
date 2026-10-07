@@ -138,8 +138,8 @@ impl Ledger {
                 AggBucket { key: k, requests: 0, prompt_tokens: 0, completion_tokens: 0, failures: 0 }
             });
             b.requests += 1;
-            b.prompt_tokens += r.prompt_tokens;
-            b.completion_tokens += r.completion_tokens;
+            b.prompt_tokens = b.prompt_tokens.saturating_add(r.prompt_tokens);
+            b.completion_tokens = b.completion_tokens.saturating_add(r.completion_tokens);
             if r.status >= 400 {
                 b.failures += 1;
             }

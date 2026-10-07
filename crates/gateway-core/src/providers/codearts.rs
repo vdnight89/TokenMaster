@@ -34,6 +34,8 @@ pub struct CodeartsProvider {
 
 /// 华为 SDK-HMAC-SHA256 签名（sign.ts:28-68）。
 /// canonical request = `method\nuri(补尾斜杠)\nquery\n排序header行\n''\nSignedHeaders\npayloadHash`
+/// `access_key` 进入 Authorization 的 `Access=` 段（上游按它定位账号；
+/// 签名本体只用 SK 计算，但 Access 缺失/错值会被 401 拒绝）。
 pub fn sdk_hmac_sha256_sign(
     method: &str,
     uri: &str,
@@ -41,6 +43,7 @@ pub fn sdk_hmac_sha256_sign(
     headers: &[(String, String)],
     payload: &[u8],
     secret: &str,
+    access_key: &str,
 ) -> String {
     use sha2::{Digest, Sha256};
     
@@ -80,7 +83,7 @@ pub fn sdk_hmac_sha256_sign(
     let signature = format!("{:x}", mac.finalize().into_bytes());
 
     format!(
-        "SDK-HMAC-SHA256 Access=not-set,SignedHeaders={},Signature={signature}",
+        "SDK-HMAC-SHA256 Access={access_key},SignedHeaders={},Signature={signature}",
         signed_headers.join(";"),
     )
 }
@@ -247,7 +250,7 @@ impl CodeartsProvider {
             ("x-sdk-content-sha256".to_string(), ph),
             ("x-sdk-date".to_string(), now.clone()),
         ];
-        let auth = sdk_hmac_sha256_sign("POST", CHAT_PATH, "", &signed_headers, payload.as_bytes(), &sk);
+        let auth = sdk_hmac_sha256_sign("POST", CHAT_PATH, "", &signed_headers, payload.as_bytes(), &sk, &ak);
 
         let mut h = reqwest::header::HeaderMap::new();
         let ins = reqwest::header::HeaderValue::from_str;

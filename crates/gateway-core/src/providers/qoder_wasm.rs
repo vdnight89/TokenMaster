@@ -555,7 +555,12 @@ fn link_all(linker: &mut Linker<Ctx>) -> Result<(), WasmError> {
     push_import!("__wbg_subarray_0f98d3fb634508ad", vec![i32v.clone(), i32v.clone(), i32v.clone()], vec![i32v.clone()], |mut caller: Caller<'_, Ctx>, args, results| {
         let (a, s, e) = (get_i32!(args, 0) as u32, get_i32!(args, 1).max(0) as usize, get_i32!(args, 2).max(0) as usize);
         let out = match caller.data().val(a) {
-            HostVal::Bytes(b) => HostVal::Bytes(b[s.min(b.len())..e.min(b.len())].to_vec()),
+            HostVal::Bytes(b) => {
+                // clamp 到 [0, len] 且保证 start<=end：畸形 (s>e) 会切出反向区间 panic
+                let end = e.min(b.len());
+                let start = s.min(end);
+                HostVal::Bytes(b[start..end].to_vec())
+            }
             _ => HostVal::Bytes(vec![]),
         };
         let idx = caller.data_mut().push(out);

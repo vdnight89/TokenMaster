@@ -212,3 +212,37 @@ async fn sse_error_frame_11140_also_caught() {
         "200+SSE 错误帧 11140 也要捕获：{err:?}"
     );
 }
+
+/// 刷新调度器走 `Arc<dyn Provider>` 进 trait refresh——必须委托到固有
+/// `BuddyProvider::refresh` 而不是递归回 trait 默认实现（旧实现
+/// `Provider::refresh(self, cred)` 会无限递归栈溢出）。timeout 兜底：
+/// 若回归成递归，这里以超时失败而不是挂死整个测试进程。
+#[tokio::test]
+async fn trait_refresh_delegates_to_inherent_impl() {
+    let (base, cap) = spawn().await;
+    let p: Arc<dyn Provider> = Arc::new(BuddyProvider::new(base));
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        p.refresh(&cred()),
+    )
+    .await
+    .expect("trait refresh 不得递归（10s 超时）")
+    .unwrap();
+    let v: Value = serde_json::from_str(&out.secret).unwrap();
+    assert_eq!(v["access_token"], json!("bd-at2"), "token 已轮换");
+    assert!(cap.auth_headers.lock().unwrap().is_some(), "确实打到了 refresh 端点");
+}
+
+/// 凭据是合法 JSON 但不是对象（如数组）→ Credential 错误而不是 panic。
+/// （当前在 refresh_token 读取处即被挡下；as_object_mut 的防御分支保证
+/// 未来取值路径变化时也不会 panic。）
+#[tokio::test]
+async fn refresh_non_object_credential_is_rejected_not_panicking() {
+    let (base, _) = spawn().await;
+    let bad = Credential { account_id: "b1".into(), secret: r#"[1,2,3]"#.into() };
+    let err = BuddyProvider::new(base).refresh(&bad).await.unwrap_err();
+    assert!(
+        matches!(err, ProviderError::Credential(_)),
+        "非对象凭据 → Credential：{err:?}"
+    );
+}

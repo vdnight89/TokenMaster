@@ -99,7 +99,8 @@ pub struct Usage {
 
 impl Usage {
     pub fn sum(p: u64, c: u64) -> Self {
-        Self { prompt_tokens: p, completion_tokens: c, total_tokens: p + c }
+        // 上游 JSON 的 token 数不受信任：饱和加法防溢出 panic
+        Self { prompt_tokens: p, completion_tokens: c, total_tokens: p.saturating_add(c) }
     }
 }
 

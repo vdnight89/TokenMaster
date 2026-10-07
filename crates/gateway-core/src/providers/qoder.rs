@@ -649,7 +649,11 @@ impl QoderOAuth {
             .map(str::to_string)
             .unwrap_or(rt);
         let mut out = old.clone();
-        let obj = out.as_object_mut().unwrap();
+        // 凭据可能解析成 JSON 但不是对象（裸数字/数组）——不能 unwrap，
+        // 按凭据错误上抛（手工/损坏凭据不应 panic 网关）。
+        let obj = out
+            .as_object_mut()
+            .ok_or_else(|| ProviderError::Credential("qoder 凭据非 JSON 对象".into()))?;
         obj.insert("access_token".into(), Value::String(token.clone()));
         obj.insert("security_oauth_token".into(), Value::String(token));
         obj.insert("refresh_token".into(), Value::String(new_rt));
@@ -920,9 +924,10 @@ mod wasm_infer {
         async fn complete(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChatCompletion, ProviderError> {
             let (status, body) = send_encrypted(cred, route, req)?;
             if status != 200 {
+                // 按字符截断：字节切片在多字节 UTF-8 边界上会 panic
                 return Err(ProviderError::Upstream(format!(
                     "qoder infer http {status}: {}",
-                    &body[..body.len().min(200)]
+                    body.chars().take(200).collect::<String>()
                 )));
             }
             let agg = aggregate_sse(&body)?;

@@ -142,3 +142,26 @@ fn human_duration_parser() {
     assert_eq!(p("in 2h"), Some(7200));
     assert_eq!(p("no duration"), None);
 }
+
+/// 刷新调度器走 `Arc<dyn Provider>` 进 trait refresh——必须委托到固有
+/// `ClineProvider::refresh`。stub 不带 /api/v1/auth/refresh 路由（404 →
+/// Upstream），若旧实现递归回 trait 默认实现则应得到 BadRequest；
+/// timeout 兜底防递归挂死测试进程。
+#[tokio::test]
+async fn trait_refresh_delegates_to_inherent_impl() {
+    let (base, _) = spawn().await;
+    let p: Arc<dyn Provider> = Arc::new(ClineProvider::new(base));
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        p.refresh(&cred()),
+    )
+    .await
+    .expect("trait refresh 不得递归（10s 超时）");
+    // stub 未实现 refresh 端点（404）：走固有实现 → Upstream“http 404”。
+    // 若回归成 trait 默认实现 → BadRequest（可判别）。
+    let err = out.unwrap_err();
+    assert!(
+        matches!(err, ProviderError::Upstream(ref m) if m.contains("404")),
+        "trait refresh 应回固有实现的 Upstream(404)，得到 {err:?}"
+    );
+}

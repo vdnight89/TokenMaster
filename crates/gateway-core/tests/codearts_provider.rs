@@ -17,8 +17,8 @@ fn hmac_sign_produces_correct_structure() {
         ("x-sdk-content-sha256".to_string(), "abc123".to_string()),
         ("x-sdk-date".to_string(), "20261007T120000Z".to_string()),
     ];
-    let sig = sdk_hmac_sha256_sign("POST", "/api/v2/chat/completions", "", &headers, b"{}", "test-secret");
-    assert!(sig.starts_with("SDK-HMAC-SHA256 Access=not-set,"), "{sig}");
+    let sig = sdk_hmac_sha256_sign("POST", "/api/v2/chat/completions", "", &headers, b"{}", "test-secret", "test-ak");
+    assert!(sig.starts_with("SDK-HMAC-SHA256 Access=test-ak,"), "{sig}");
     assert!(sig.contains("SignedHeaders=content-type;host;x-sdk-content-sha256;x-sdk-date"), "{sig}");
     assert!(sig.contains("Signature="), "{sig}");
     // 签名是 64 位 hex
@@ -32,11 +32,11 @@ fn hmac_sign_deterministic() {
         ("host".to_string(), "h".to_string()),
         ("x-sdk-date".to_string(), "d".to_string()),
     ];
-    let s1 = sdk_hmac_sha256_sign("GET", "/", "", &headers, b"", "key");
-    let s2 = sdk_hmac_sha256_sign("GET", "/", "", &headers, b"", "key");
+    let s1 = sdk_hmac_sha256_sign("GET", "/", "", &headers, b"", "key", "ak");
+    let s2 = sdk_hmac_sha256_sign("GET", "/", "", &headers, b"", "key", "ak");
     assert_eq!(s1, s2);
     // 不同 key 不同签名
-    let s3 = sdk_hmac_sha256_sign("GET", "/", "", &headers, b"", "other");
+    let s3 = sdk_hmac_sha256_sign("GET", "/", "", &headers, b"", "other", "ak");
     assert_ne!(s1, s3);
 }
 

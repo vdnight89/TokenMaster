@@ -225,8 +225,11 @@ pub fn completion_from_anthropic(model: &str, v: &Value) -> Result<ChatCompletio
     let usage = Usage {
         prompt_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
         completion_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
-        total_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0)
-            + v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        // 上报数字不受信任：饱和加法防溢出 panic
+        total_tokens: v["usage"]["input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_add(v["usage"]["output_tokens"].as_u64().unwrap_or(0)),
     };
     let stop = v.get("stop_reason").and_then(Value::as_str).unwrap_or("stop");
     let finish = match stop {

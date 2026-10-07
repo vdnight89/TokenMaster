@@ -106,7 +106,11 @@ impl ClineProvider {
             .map(str::to_string)
             .unwrap_or(rt);
         let mut out = old.clone();
-        let obj = out.as_object_mut().unwrap();
+        // 凭据可能解析成 JSON 但不是对象（如裸数字/数组）——不能 unwrap（恶意/手工
+        // 凭据会让网关 panic），按凭据错误上抛。
+        let obj = out
+            .as_object_mut()
+            .ok_or_else(|| ProviderError::Credential("cline 凭据非 JSON 对象".into()))?;
         obj.insert("access_token".into(), Value::String(new_token));
         obj.insert("refresh_token".into(), Value::String(new_rt));
         Ok(Credential { secret: out.to_string(), ..cred.clone() })
@@ -195,6 +199,8 @@ impl ClineProvider {
     }
 
     /// 解析人类可读时长（`19h 39m` / `45m` / `2h`）。
+    /// 上游文案里的数字不受信任：乘加全用 saturating（巨数溢出只会得到
+    /// u64::MAX 冷却，而不是 panic）。
     pub fn parse_human_duration(text: &str) -> Option<u64> {
         let mut total_secs: u64 = 0;
         let mut found = false;
@@ -206,13 +212,13 @@ impl ClineProvider {
                 if !num.is_empty() {
                     if let Ok(v) = num.parse::<u64>() {
                         if ch == 'h' {
-                            total_secs += v * 3600;
+                            total_secs = total_secs.saturating_add(v.saturating_mul(3600));
                             found = true;
                         } else if ch == 'm' {
-                            total_secs += v * 60;
+                            total_secs = total_secs.saturating_add(v.saturating_mul(60));
                             found = true;
                         } else if ch == 's' {
-                            total_secs += v;
+                            total_secs = total_secs.saturating_add(v);
                             found = true;
                         }
                     }
@@ -331,7 +337,10 @@ impl Provider for ClineProvider {
     }
 
     async fn refresh(&self, cred: &Credential) -> Result<Credential, ProviderError> {
-        Provider::refresh(self, cred).await
+        // 注意必须显式走固有实现：`Provider::refresh(self, cred)` 解析到的是
+        // 本 trait 方法自身（无限递归→栈溢出）；刷新调度器走 dyn Provider
+        // 进来的正是这里。
+        ClineProvider::refresh(self, cred).await
     }
 
     async fn complete(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChatCompletion, ProviderError> {

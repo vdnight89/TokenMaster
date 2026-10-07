@@ -10,8 +10,9 @@ import type { PageKey } from "./lib/nav";
 import { Ic } from "./lib/icons";
 import { toast, ToastHost } from "./lib/toast";
 import type { ModalKind } from "./lib/ui";
-import { ACCOUNTS, TODOS } from "./lib/mock";
-import type { Account } from "./lib/mock";
+import { ACCOUNTS, PROVIDERS, TODOS, PV_KEYS } from "./lib/mock";
+import type { Account, AccState, PvKey } from "./lib/mock";
+import type { AccountInfo } from "./lib/ipc";
 import Dash from "./pages/Dash";
 import Accounts from "./pages/Accounts";
 import Gateway from "./pages/Gateway";
@@ -26,16 +27,47 @@ import { winClose, winMinimize, winToggleMaximize } from "./lib/window";
 import { useLang } from "./lib/i18n";
 import { useAccounts } from "./lib/ipc";
 
+/** Unix 秒 → "MM-DD HH:mm"（mock Account.when 同形态） */
+function fmtWhen(ts: number): string {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  const p2 = (n: number) => String(n).padStart(2, "0");
+  return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
+
+/**
+ * IPC 账号（AccountInfo）→ 页面账号卡（Account）的显式适配。
+ * 之前用 `as unknown as Account[]` 硬转：IPC 形状缺 pv/q/when/tier，
+ * Accounts 页渲染 `PROVIDERS[a.pv].name` / `a.q.map` 会当场崩溃；
+ * 这里逐字段映射，未知 provider / 未知 state 落到安全默认值。
+ */
+function accountFromIpc(a: AccountInfo): Account | null {
+  const pv = (PV_KEYS as readonly string[]).includes(a.provider) ? (a.provider as PvKey) : null;
+  if (pv === null) return null; // 目录外的 provider：账号卡无法渲染品牌，先不展示
+  const state: AccState =
+    a.state === "off" || a.state === "dead" || a.state === "cool" || a.state === "exp" ? a.state : "ok";
+  return {
+    pv,
+    name: a.name,
+    state,
+    tier: PROVIDERS[pv].tier,
+    cur: false,
+    q: [], // IPC 尚不下发额度明细（余额接线是后续任务），空列表渲染为无额度条
+    when: fmtWhen(a.updated_at),
+  };
+}
+
 export default function App() {
   const [page, go] = useHashPage();
   const [gwOn, setGwOn] = useState(true);
   const [lang, setLang] = useLang();
   const [accounts, setAccounts] = useState<Account[]>(ACCOUNTS);
   // Tauri 环境下用 IPC 真数据替换 mock；浏览器 dev 保持 mock
-  // 类型暂时 cast（IPC 数据形状与 mock Account 对齐是 T5.11 后续工作）
-  const { data: ipcAccounts, isReal: accountsLive } = useAccounts([] as never[]);
+  const { data: ipcAccounts, isReal: accountsLive } = useAccounts([]);
   useEffect(() => {
-    if (accountsLive) setAccounts(ipcAccounts as unknown as Account[]);
+    if (accountsLive) {
+      setAccounts(ipcAccounts.map(accountFromIpc).filter((a): a is Account => a !== null));
+    }
   }, [ipcAccounts, accountsLive]);
   const [doneTodos, setDoneTodos] = useState<ReadonlySet<string>>(() => new Set());
   const [modal, setModal] = useState<ModalKind>(null);

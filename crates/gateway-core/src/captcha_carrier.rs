@@ -53,7 +53,8 @@ impl CaptchaSupplyPool {
 
     /// 入池一个 param（Tauri 载体产出后调用）。
     pub fn push_param(&self, param: &str, region: &str) {
-        let mut q = self.ready.lock().unwrap();
+        // 锁中毒不致命（临界区无 invariant）：恢复数据继续
+        let mut q = self.ready.lock().unwrap_or_else(|e| e.into_inner());
         if q.len() < self.max_pool {
             q.push_back(CaptchaParam {
                 param: param.to_string(),
@@ -62,14 +63,14 @@ impl CaptchaSupplyPool {
             });
         }
         // 成功产出 → 重置退避
-        *self.consecutive_failures.lock().unwrap() = 0;
-        *self.next_carrier_at.lock().unwrap() = None;
+        *self.consecutive_failures.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+        *self.next_carrier_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// 从池取一个 param（claim 遇 3007 时调用）。
     /// 过期的 param 自动丢弃。
     pub fn acquire_param(&self) -> Option<CaptchaParam> {
-        let mut q = self.ready.lock().unwrap();
+        let mut q = self.ready.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(front) = q.front() {
             if front.produced_at.elapsed() > self.param_ttl {
                 q.pop_front(); // 过期丢弃
@@ -80,12 +81,18 @@ impl CaptchaSupplyPool {
         None
     }
 
+    /// 是否有可用 param（不消费——查询语义，param 是一次性资源不能白扔）。
+    fn has_ready_param(&self) -> bool {
+        let q = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+        q.front().is_some_and(|p| p.produced_at.elapsed() <= self.param_ttl)
+    }
+
     /// 是否需要拉起载体（池空且退避已过）。
     pub fn should_launch_carrier(&self) -> bool {
-        if self.acquire_param().is_some() {
+        if self.has_ready_param() {
             return false; // 池里还有
         }
-        let next = self.next_carrier_at.lock().unwrap();
+        let next = self.next_carrier_at.lock().unwrap_or_else(|e| e.into_inner());
         match *next {
             Some(t) => Instant::now() >= t,
             None => true, // 无退避
@@ -95,7 +102,9 @@ impl CaptchaSupplyPool {
     /// 记录一次载体失败（拉起后未产出 param）→ 退避递增。
     /// 30s → 60s → 120s → 300s（上限 5 分钟）。
     pub fn record_carrier_failure(&self) -> Duration {
-        let mut fails = self.consecutive_failures.lock().unwrap();
+        // 注：fails 持锁期间取 next_carrier_at——全库只有这一处嵌套顺序
+        //（consecutive_failures → next_carrier_at），无反向路径，不会死锁。
+        let mut fails = self.consecutive_failures.lock().unwrap_or_else(|e| e.into_inner());
         *fails += 1;
         let backoff = match *fails {
             1 => Duration::from_secs(30),
@@ -103,13 +112,13 @@ impl CaptchaSupplyPool {
             3 => Duration::from_secs(120),
             _ => Duration::from_secs(300),
         };
-        *self.next_carrier_at.lock().unwrap() = Some(Instant::now() + backoff);
+        *self.next_carrier_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + backoff);
         backoff
     }
 
     /// 当前池大小（可读的 param 数，含过期判定）。
     pub fn ready_count(&self) -> usize {
-        let q = self.ready.lock().unwrap();
+        let q = self.ready.lock().unwrap_or_else(|e| e.into_inner());
         q.iter().filter(|p| p.produced_at.elapsed() <= self.param_ttl).count()
     }
 }

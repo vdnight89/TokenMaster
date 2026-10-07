@@ -425,8 +425,9 @@ impl ZcodeProvider {
         let mut total = 0u64;
         let mut expires_at: Option<u64> = None;
         for b in &buckets {
-            remaining += b.available_units.or(b.remaining_units).unwrap_or(0);
-            total += b.total_units.unwrap_or(0);
+            // 上游 JSON 数字不受信任：饱和加法防巨数溢出 panic
+            remaining = remaining.saturating_add(b.available_units.or(b.remaining_units).unwrap_or(0));
+            total = total.saturating_add(b.total_units.unwrap_or(0));
             if let Some(exp) = b.expires_at {
                 expires_at = Some(match expires_at {
                     Some(prev) => prev.min(exp),
@@ -1425,8 +1426,11 @@ fn completion_from_zcode(model: &str, v: &Value) -> Result<ChatCompletion, Strin
     let usage = Usage {
         prompt_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
         completion_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
-        total_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0)
-            + v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        // 上报数字不受信任：饱和加法防溢出 panic
+        total_tokens: v["usage"]["input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_add(v["usage"]["output_tokens"].as_u64().unwrap_or(0)),
     };
     let stop = v
         .get("stop_reason")

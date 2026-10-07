@@ -71,7 +71,8 @@ pub fn run() {
                 Some(state.ledger.clone()),
             ))
             .map_err(|e| format!("gateway start failed: {e}"))?;
-            *state.handle.lock().unwrap() = Some(handle);
+            // 锁中毒不致命（Option 槽无 invariant）：恢复数据继续
+            *state.handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 
             // T6.1 托盘：菜单（显示/退出）+ tooltip
             let _tray = app.tray_by_id("main");
@@ -166,7 +167,11 @@ fn usage_summary(state: State<GatewayState>) -> Result<serde_json::Value, String
     let recent = ledger.recent(500);
     let today: Vec<_> = recent.iter().filter(|r| r.ts >= today_start).collect();
     let today_requests = today.len() as u64;
-    let today_tokens: u64 = today.iter().map(|r| r.prompt_tokens + r.completion_tokens).sum();
+    // token 数来自上游响应，饱和累加防巨数溢出 panic
+    let today_tokens: u64 = today
+        .iter()
+        .map(|r| r.prompt_tokens.saturating_add(r.completion_tokens))
+        .fold(0u64, u64::saturating_add);
     let mut by_provider = serde_json::Map::new();
     for b in ledger.aggregate_by_provider() {
         by_provider.insert(b.key.clone(), serde_json::json!({

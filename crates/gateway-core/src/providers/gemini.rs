@@ -260,11 +260,11 @@ impl SigStore {
 
     /// 当前条目数（诊断/测试用）。
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.lock().unwrap().is_empty()
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// 读已有文件恢复（缺失/损坏降级为空表，推理不因此中断——纯缓存）。
@@ -284,7 +284,7 @@ impl SigStore {
             let name = e.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
             entries.push(SigEntry { key: k.clone(), sig: sig.to_string(), at, name });
         }
-        *store.entries.lock().unwrap() = entries;
+        *store.entries.lock().unwrap_or_else(|e| e.into_inner()) = entries;
         store
     }
 
@@ -312,7 +312,7 @@ impl SigStore {
         }
         let key = Self::key(name, canonical_args);
         let at = now_ts_secs();
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.retain(|e| e.key != key); // 覆盖并挪到末尾（Map 插入序语义）
         entries.push(SigEntry { key, sig: sig.to_string(), at, name: name.to_string() });
         if entries.len() > SIG_MAX_ENTRIES {
@@ -342,7 +342,7 @@ impl SigStore {
     pub fn lookup(&self, name: &str, args: &Value) -> Option<String> {
         let canonical = alphabetize(args).to_string();
         let key = Self::key(name, &canonical);
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = entries.iter().rev().find(|e| e.key == key && !e.sig.is_empty()) {
             return Some(e.sig.clone());
         }
@@ -360,7 +360,7 @@ impl SigStore {
             return;
         }
         let Some(p) = &self.path else { return };
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let mut obj = Map::new();
         for e in entries.iter() {
             obj.insert(
@@ -495,7 +495,7 @@ impl GeminiProvider {
     /// 会话解析：派生因子变化 → 切换新会话（gen 归零）；返回当前代 sessionId。
     fn current_session_id(&self, project: &str, req: &ChatRequest) -> String {
         let base = Self::derive_session_id(project, &Self::first_user_text(req), "infer");
-        let mut s = self.session.lock().unwrap();
+        let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
         if s.base != base {
             *s = SessionState { base, gen: 0 };
         }
@@ -505,7 +505,7 @@ impl GeminiProvider {
     /// 升代：gen+1 换新 id（服务端按 id 累计，削本地历史无用）。
     fn bump_generation(&self, project: &str, req: &ChatRequest) -> String {
         let base = Self::derive_session_id(project, &Self::first_user_text(req), "infer");
-        let mut s = self.session.lock().unwrap();
+        let mut s = self.session.lock().unwrap_or_else(|e| e.into_inner());
         if s.base != base {
             *s = SessionState { base, gen: 0 };
         }
@@ -623,13 +623,13 @@ impl GeminiProvider {
         } else {
             detected.to_string()
         };
-        *self.resolved_project.lock().unwrap() = Some(project.clone());
+        *self.resolved_project.lock().unwrap_or_else(|e| e.into_inner()) = Some(project.clone());
         Ok(project)
     }
 
     /// 推理路径：缓存优先，miss 时探测一次。
     async fn resolve_project(&self, cred: &Credential) -> Result<String, ProviderError> {
-        if let Some(p) = self.resolved_project.lock().unwrap().clone() {
+        if let Some(p) = self.resolved_project.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             return Ok(p);
         }
         self.detect_project(cred).await
@@ -1350,7 +1350,8 @@ impl GeminiOAuth {
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| fallback_rt.map(str::to_string));
-        let expires_at = now_ts_secs() + v.get("expires_in").and_then(Value::as_u64).unwrap_or(3600);
+        // expires_in 来自 OAuth 端点响应：饱和加法防巨数溢出 panic
+        let expires_at = now_ts_secs().saturating_add(v.get("expires_in").and_then(Value::as_u64).unwrap_or(3600));
         let secret = serde_json::json!({
             "access_token": at,
             "refresh_token": rt,
@@ -1395,7 +1396,7 @@ impl GeminiOAuth {
                             return (axum::http::StatusCode::FORBIDDEN, "state mismatch");
                         }
                         let res = this.exchange_code(code, &format!("http://localhost:{port}/oauth-callback")).await;
-                        if let Some(tx) = tx.lock().unwrap().take() {
+                        if let Some(tx) = tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
                             let _ = tx.send(res);
                         }
                         (axum::http::StatusCode::OK, "TokenMaster: 登录完成，可关闭此页")

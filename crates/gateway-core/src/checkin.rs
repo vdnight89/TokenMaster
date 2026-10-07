@@ -103,10 +103,11 @@ impl AutoCheckin {
     }
 
     pub fn is_enabled(&self) -> bool {
-        *self.enabled.lock().unwrap()
+        // 锁中毒不致命（bool 标志无 invariant）：恢复数据继续
+        *self.enabled.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn set_enabled(&self, on: bool) {
-        *self.enabled.lock().unwrap() = on;
+        *self.enabled.lock().unwrap_or_else(|e| e.into_inner()) = on;
     }
 }

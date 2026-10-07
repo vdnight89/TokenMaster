@@ -69,7 +69,8 @@ pub async fn complete_with_retry(
                 return Err(ApiError::Upstream { status: 400, code: "context_window_exceeded".into(), msg });
             }
             Err(e @ ProviderError::RateLimited { retry_after_secs, .. }) => {
-                let until = now + retry_after_secs.unwrap_or(DEFAULT_RATE_LIMIT_SECS);
+                // retry_after 来自上游（头/报文/文案解析），饱和加法防巨数溢出
+                let until = now.saturating_add(retry_after_secs.unwrap_or(DEFAULT_RATE_LIMIT_SECS));
                 pool.lock()
                     .unwrap_or_else(|e2| e2.into_inner())
                     .mark_model_rate_limited(&account_id, &model, until);

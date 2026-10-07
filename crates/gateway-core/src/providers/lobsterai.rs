@@ -121,7 +121,11 @@ impl LobsteraiProvider {
             .map(str::to_string)
             .unwrap_or(rt);
         let mut out = old.clone();
-        let obj = out.as_object_mut().unwrap();
+        // 凭据可能解析成 JSON 但不是对象（裸数字/数组）——不能 unwrap，
+        // 按凭据错误上抛（手工/损坏凭据不应 panic 网关）。
+        let obj = out
+            .as_object_mut()
+            .ok_or_else(|| ProviderError::Credential("lobsterai 凭据非 JSON 对象".into()))?;
         obj.insert("access_token".into(), Value::String(new_token));
         obj.insert("refresh_token".into(), Value::String(new_rt));
         Ok(Credential { secret: out.to_string(), ..cred.clone() })
@@ -243,7 +247,9 @@ impl Provider for LobsteraiProvider {
     }
 
     async fn refresh(&self, cred: &Credential) -> Result<Credential, ProviderError> {
-        Provider::refresh(self, cred).await
+        // 显式走固有实现：`Provider::refresh(self, cred)` 会解析到本 trait 方法
+        // 自身（无限递归→栈溢出）；刷新调度器经 dyn Provider 进来的正是这里。
+        LobsteraiProvider::refresh(self, cred).await
     }
 
     async fn complete(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChatCompletion, ProviderError> {

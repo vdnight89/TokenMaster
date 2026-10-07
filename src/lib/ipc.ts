@@ -31,6 +31,9 @@ export interface AccountInfo {
   provider: string;
   name: string;
   state: "ok" | "cool" | "exp" | "dead" | "off";
+  /** Unix 秒（list_accounts IPC 下发） */
+  created_at: number;
+  updated_at: number;
   balance?: string;
   expires?: string;
 }
@@ -55,15 +58,18 @@ import { useEffect, useState } from "react";
 function useIPCData<T>(
   command: string,
   fallback: T,
+  args?: Record<string, unknown>,
 ): { data: T; loading: boolean; isReal: boolean } {
   const [data, setData] = useState<T>(fallback);
   const [loading, setLoading] = useState(isTauri());
   const [isReal, setIsReal] = useState(false);
+  // args 序列化进依赖：对象身份每次渲染都变会反复触发请求，用稳定串代替
+  const argsKey = args === undefined ? "" : JSON.stringify(args);
 
   useEffect(() => {
     if (!isTauri()) return;
     let cancelled = false;
-    invoke<T>(command)
+    invoke<T>(command, args)
       .then((result) => {
         if (!cancelled) {
           setData(result);
@@ -79,7 +85,8 @@ function useIPCData<T>(
     return () => {
       cancelled = true;
     };
-  }, [command]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [command, argsKey]);
 
   return { data, loading, isReal };
 }
@@ -119,8 +126,8 @@ export interface LogEntry {
   proto: string;
 }
 
-/** 请求日志 */
+/** 请求日志（limit 作为 invoke 参数传递——拼进命令名会得到不存在的 command） */
 export function useLogs(fallback: LogEntry[], limit?: number) {
-  const cmd = limit ? `list_logs ${limit}` : 'list_logs';
-  return useIPCData(cmd, fallback);
+  const args = limit === undefined ? undefined : { limit };
+  return useIPCData("list_logs", fallback, args);
 }
