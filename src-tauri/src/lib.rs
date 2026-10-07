@@ -119,8 +119,25 @@ fn list_providers() -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 fn list_accounts() -> Result<serde_json::Value, String> {
-    // TODO: 从 TokenPool / Store 读真数据；暂返回空（GUI 显示「暂无账号」引导添加）
-    Ok(serde_json::json!([]))
+    let store = gateway_core::store::Store::open_default()
+        .map_err(|e| format!("store open failed: {e}"))?;
+    let accounts = store
+        .load_accounts()
+        .map_err(|e| format!("load accounts failed: {e}"))?;
+    let items: Vec<serde_json::Value> = accounts
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "id": a.id,
+                "provider": a.provider,
+                "name": a.label,
+                "state": if a.enabled { "ok" } else { "off" },
+                "created_at": a.created_at,
+                "updated_at": a.updated_at,
+            })
+        })
+        .collect();
+    Ok(serde_json::Value::Array(items))
 }
 
 #[tauri::command]

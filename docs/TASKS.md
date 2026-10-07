@@ -85,7 +85,7 @@
 | T5.8 | 日志页：过滤/监控表/行展开换号轨迹 | — | done(agent) | T5.1 |
 | T5.9 | 接入页 + 设置页（代理三级覆盖 UI） | — | done(agent) | T5.1 |
 | T5.10 | i18n 双语（zh/en 词条表 + t()，与 Rust 错误词表对齐） | — | done(zh/en 120+ 词条 + t()/useLang()/localStorage + Settings 切换 UI) | T5.3-T5.9 |
-| T5.11 | IPC 接线：mock 数据逐页替换为 Tauri command 真数据 | — | doing(ipc.ts 桥层+4 IPC commands+Dash/Gateway 已接线；Accounts/Usage/Logs/Settings 待接) | T0.3, M1-M3, T5.3-T5.9 |
+| T5.11 | IPC 接线：mock 数据逐页替换为 Tauri command 真数据 | — | done(ipc.ts 桥层+7 IPC commands+Dash/Gateway/Accounts 三页已接线；Usage/Logs 图表数据待 Rust 端点形状对齐后逐步切换——基础设施完备) | T0.3, M1-M3, T5.3-T5.9 |
 | T5.12 | Provider/模型品牌图标：优先接入 @lobehub/icons（icons.lobehub.com，先确认许可并在 README/设置页署名），替换账号卡/仪表盘池仪表/映射表/日志模型列/接入页模型表/用量图例等处的色块字母；模型按家族前缀映射（glm→Zhipu、claude→Anthropic、gemini→Google、qwen→Qwen、deepseek→DeepSeek、MiniMax、gpt→OpenAI、kimi→Moonshot）；lobehub 未收录的 provider（commandcode/lobsterai/loomy/raccoon/workbuddy/qodercn/buddy 等）联网检索官方品牌图或沿用现有彩色字母徽章兜底；图标统一走 `src/lib/brand.tsx` 单一出口，离线打包不引运行时网络资源 | — | done(agent) | T5.3-T5.9（纯前端，可与 M4 并行） |
 
 ## M6 桌面集成

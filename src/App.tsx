@@ -24,12 +24,19 @@ import ClaimModal from "./modals/ClaimModal";
 import ImportModal from "./modals/ImportModal";
 import { winClose, winMinimize, winToggleMaximize } from "./lib/window";
 import { useLang } from "./lib/i18n";
+import { useAccounts } from "./lib/ipc";
 
 export default function App() {
   const [page, go] = useHashPage();
   const [gwOn, setGwOn] = useState(true);
   const [lang, setLang] = useLang();
   const [accounts, setAccounts] = useState<Account[]>(ACCOUNTS);
+  // Tauri 环境下用 IPC 真数据替换 mock；浏览器 dev 保持 mock
+  // 类型暂时 cast（IPC 数据形状与 mock Account 对齐是 T5.11 后续工作）
+  const { data: ipcAccounts, isReal: accountsLive } = useAccounts([] as never[]);
+  useEffect(() => {
+    if (accountsLive) setAccounts(ipcAccounts as unknown as Account[]);
+  }, [ipcAccounts, accountsLive]);
   const [doneTodos, setDoneTodos] = useState<ReadonlySet<string>>(() => new Set());
   const [modal, setModal] = useState<ModalKind>(null);
 
