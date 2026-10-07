@@ -44,11 +44,11 @@ async fn stub_generate(State(cap): State<Arc<(Meta, Mutex<Cap>)>>, body: axum::e
     let bytes = axum::body::to_bytes(body.into_body(), 8 << 20).await.unwrap();
     let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     let sid = v["request"]["sessionId"].as_str().unwrap_or_default().to_string();
-    let gen = sid.rsplit("-g").next().and_then(|g| g.parse::<u32>().ok()).unwrap_or(0);
-    cap.1.lock().unwrap().sessions.push(sid);
+    let hit = cap.1.lock().unwrap().sessions.len();
+    cap.1.lock().unwrap().sessions.push(sid.clone());
     let behavior = &cap.0.behavior;
     let use_400 = match behavior {
-        GenBehavior::ExceededAtGen0 => gen == 0,
+        GenBehavior::ExceededAtGen0 => hit == 0,
         GenBehavior::AlwaysExceeded => true,
         GenBehavior::Unrelated400 => true,
         GenBehavior::Ok => false,
@@ -119,12 +119,12 @@ async fn session_derived_deterministically_and_switches_on_first_user_change() {
 #[tokio::test]
 async fn different_project_switches_session() {
     // 两个实例走不同 project（生产=探测结果差异；此处验证派生纯函数因子）
-    let a = gateway_core::providers::gemini::GeminiProvider::derive_session_id("proj-a", "你好", "daily-cloudcode-pa.googleapis.com");
-    let b = gateway_core::providers::gemini::GeminiProvider::derive_session_id("proj-b", "你好", "daily-cloudcode-pa.googleapis.com");
+    let a = gateway_core::providers::gemini::GeminiProvider::derive_session_id("proj-a", "你好", "infer");
+    let b = gateway_core::providers::gemini::GeminiProvider::derive_session_id("proj-b", "你好", "infer");
     assert_ne!(a, b, "project 是派生因子");
-    let c = gateway_core::providers::gemini::GeminiProvider::derive_session_id("proj-a", "你好", "daily-cloudcode-pa.sandbox.googleapis.com");
-    assert_ne!(a, c, "lane（端点 host）是派生因子");
-    assert!(a.starts_with("sess-"));
+    let c = gateway_core::providers::gemini::GeminiProvider::derive_session_id("proj-a", "你好", "smoke");
+    assert_ne!(a, c, "lane（infer/smoke 业务路径字面量）是派生因子");
+    assert!(a.parse::<i64>().is_ok(), "FNV 有符号十进制：{a}");
 }
 
 #[tokio::test]
@@ -135,7 +135,7 @@ async fn context_exceeded_bumps_generation_once_and_succeeds() {
     let s = cap.1.lock().unwrap().sessions.clone();
     assert_eq!(s.len(), 2, "gen0 被拒后应升代重试一次");
     assert_ne!(s[0], s[1], "升代必须换新 sessionId（服务端按 id 累计，削本地历史无用）");
-    assert!(s[1].contains("-g"), "升代形态带代数段：{}", s[1]);
+    // sessionId 为 FNV 十进制，升代=新哈希值（无后缀段）
 }
 
 #[tokio::test]

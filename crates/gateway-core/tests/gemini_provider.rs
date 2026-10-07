@@ -132,7 +132,8 @@ async fn five_fixed_antigravity_identity_headers_and_no_accept() {
 async fn usage_comes_from_usage_metadata() {
     let (base, _) = spawn().await;
     let out = pv(base).complete(&cred(), &route(), &req()).await.unwrap();
-    assert_eq!(out.usage.prompt_tokens, 12);
+    // 互斥口径：input = promptTokenCount(12) − cachedContentTokenCount(3) = 9
+    assert_eq!(out.usage.prompt_tokens, 9, "缓存命中须从 input 扣除（防双计费）");
     assert_eq!(out.usage.completion_tokens, 7);
 }
 
@@ -161,4 +162,21 @@ async fn unauthorized_maps_to_credential_error() {
     assert!(matches!(err, ProviderError::Credential(_)), "{err:?}");
     let err429 = gateway_core::providers::gemini::map_status_error(429, "quota".into());
     assert!(matches!(err429, ProviderError::RateLimited { .. }));
+}
+
+#[tokio::test]
+async fn envelope_carries_generation_config_and_short_user_agent() {
+    let (base, cap) = spawn().await;
+    pv(base).complete(&cred(), &route(), &req()).await.unwrap();
+    let s = cap.lock().unwrap();
+    let raw = s.raw_body.as_deref().unwrap();
+    let v: Value = serde_json::from_str(raw).unwrap();
+    let gen = &v["request"]["generationConfig"];
+    assert_eq!(gen["maxOutputTokens"], json!(64_000), "必发，缺省 64000");
+    assert_eq!(gen["thinkingConfig"]["includeThoughts"], json!(true), "恒 true（假关）");
+    assert_eq!(gen["thinkingConfig"]["thinkingBudget"], json!(4000), "默认 medium 档 4000");
+    assert_eq!(v["userAgent"], json!("antigravity"), "信封 userAgent 是短串");
+    let rid = v["requestId"].as_str().unwrap();
+    assert!(rid.starts_with("agent/") && rid.split('/').count() == 3, "agent/{{ms}}/{{8hex}}：{rid}");
+    assert!(v["request"]["systemInstruction"]["role"] == json!("system"));
 }

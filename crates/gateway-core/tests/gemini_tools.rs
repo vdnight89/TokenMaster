@@ -114,7 +114,7 @@ async fn tools_and_tool_history_map_into_envelope() {
     let fr = &contents[2]["parts"][0]["functionResponse"];
     assert_eq!(contents[2]["role"], json!("user"));
     assert_eq!(fr["name"], json!("get_weather"), "name 须来自 tool_call_id 映射，不能臆造");
-    assert_eq!(fr["response"]["result"], json!("晴 25 度"));
+    assert_eq!(fr["response"]["content"], json!("晴 25 度"), "response 用 content 键（gemini-messages.ts:246-250）");
 }
 
 #[tokio::test]

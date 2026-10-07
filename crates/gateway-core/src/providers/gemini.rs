@@ -29,6 +29,130 @@ const LOAD_PATH: &str = "/v1internal:loadCodeAssist";
 const QUOTA_PATH: &str = "/v1internal:retrieveUserQuotaSummary";
 const CLIENT_UA: &str = "antigravity/4.3.0 (cmdc-pak)";
 const DEFAULT_EFFORT_SUFFIX: &str = "-medium";
+/// 信封 userAgent 字段是短串 'antigravity'（gemini-messages.ts:340），
+/// 与 HTTP UA（含版本）不同。
+const ENVELOPE_UA: &str = "antigravity";
+const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 64_000;
+/// 思考档位 → thinkingBudget（gemini.ts:414-418；tiered=-1 不发 budget）。
+fn thinking_budget(tier: &str) -> i64 {
+    match tier {
+        "low" => 1_000,
+        "high" => 10_000,
+        "tiered" => -1,
+        _ => 4_000,
+    }
+}
+/// Gemini schema 白名单（gemini.ts GEMINI_SCHEMA_KEYS 21 键）；白名单外键
+/// 上游硬 400。递归清洗：properties/items/anyOf 深入；type 数组收敛补
+/// nullable；enum 含非字符串值整删（Gemini 只接受字符串枚举）。
+fn sanitize_schema(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            const KEYS: [&str; 21] = [
+                "type", "format", "description", "nullable", "enum", "items", "minItems",
+                "maxItems", "properties", "required", "minProperties", "maxProperties",
+                "minLength", "maxLength", "pattern", "anyOf", "propertyOrdering", "minimum",
+                "maximum", // 21 键中留 2 位给未来发展
+                "__never__", "__never2__",
+            ];
+            let mut out = Map::new();
+            for (k, val) in m {
+                if !KEYS.contains(&k.as_str()) {
+                    continue;
+                }
+                match k.as_str() {
+                    "properties" => {
+                        let mut props = Map::new();
+                        if let Some(pm) = val.as_object() {
+                            for (name, child) in pm {
+                                if child.is_object() {
+                                    props.insert(name.clone(), sanitize_schema(child));
+                                }
+                            }
+                        }
+                        out.insert("properties".into(), Value::Object(props));
+                    }
+                    "items" => {
+                        if let Value::Array(a) = val {
+                            let cleaned: Vec<Value> =
+                                a.iter().filter(|i| i.is_object()).map(sanitize_schema).collect();
+                            out.insert("items".into(), Value::Array(cleaned));
+                        } else if val.is_object() {
+                            out.insert("items".into(), sanitize_schema(val));
+                        }
+                    }
+                    "anyOf" => {
+                        if let Some(a) = val.as_array() {
+                            out.insert(
+                                "anyOf".into(),
+                                Value::Array(a.iter().filter(|i| i.is_object()).map(sanitize_schema).collect()),
+                            );
+                        }
+                    }
+                    "type" => {
+                        if let Some(arr) = val.as_array() {
+                            // 数组形态收敛成首个 + nullable
+                            let first = arr.first().cloned().unwrap_or(Value::Null);
+                            out.insert("type".into(), first);
+                            out.insert("nullable".into(), Value::Bool(true));
+                        } else {
+                            out.insert("type".into(), val.clone());
+                        }
+                    }
+                    "enum" => {
+                        let all_str = val
+                            .as_array()
+                            .map(|a| a.iter().all(|x| x.is_string()))
+                            .unwrap_or(false);
+                        if all_str {
+                            out.insert("enum".into(), val.clone());
+                        }
+                    }
+                    _ => {
+                        out.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+/// tool_choice → toolConfig（gemini-messages.ts:360-392）。
+fn build_tool_config(tool_choice: Option<&Value>) -> Option<Value> {
+    let tc = tool_choice?;
+    let mode = match tc {
+        Value::String(s) => match s.as_str() {
+            "none" => "NONE",
+            "any" | "required" => "ANY",
+            _ => "AUTO",
+        },
+        Value::Object(o) => match o.get("type").and_then(Value::as_str).unwrap_or("") {
+            "none" => "NONE",
+            "any" | "tool" | "function" => "ANY",
+            _ => "AUTO",
+        },
+        _ => "AUTO",
+    };
+    let mut fc = Map::new();
+    fc.insert("mode".into(), Value::String(mode.into()));
+    if mode == "ANY" {
+        let name = tc
+            .as_object()
+            .and_then(|o| {
+                o.get("function")
+                    .and_then(|f| f.get("name"))
+                    .or_else(|| o.get("name"))
+                    .and_then(Value::as_str)
+                    .filter(|n| !n.is_empty())
+            })
+            .map(str::to_string);
+        if let Some(n) = name {
+            fc.insert("allowedFunctionNames".into(), serde_json::json!([n]));
+        }
+    }
+    Some(serde_json::json!({ "functionCallingConfig": Value::Object(fc) }))
+}
 
 pub struct GeminiProvider {
     base: String,
@@ -83,7 +207,12 @@ impl SigStore {
     }
 
     fn key(name: &str, canonical_args: &str) -> String {
-        format!("tool:{name}{canonical_args}")
+        // gemini-sigstore.ts:57/80-94：sha256("tool:"+名+" "+canonical前512).hex[..16]
+        use sha2::{Digest, Sha256};
+        let body: String = canonical_args.chars().take(512).collect();
+        let mut h = Sha256::new();
+        h.update(format!("tool:{name} {body}"));
+        format!("{:x}", h.finalize())[..16].to_string()
     }
 
     /// 记录一次「响应中 functionCall (name, args) ↔ 签名」。
@@ -93,6 +222,10 @@ impl SigStore {
     }
 
     fn record_with_canonical(&self, name: &str, canonical_args: &str, sig: &str) {
+        let sig = sig.trim();
+        if sig.is_empty() {
+            return; // 空签名丢弃（gemini-sigstore.ts:97-99）
+        }
         self.exact
             .lock()
             .unwrap()
@@ -126,27 +259,7 @@ struct SessionState {
     gen: u32,
 }
 
-fn format_session(s: &SessionState) -> String {
-    if s.gen == 0 {
-        s.base.clone()
-    } else {
-        format!("{}-g{}", s.base, s.gen)
-    }
-}
 
-/// lane 语义参考实现未载明；按上游端点 host 近似（daily/sandbox 两条端点
-/// 即两条 lane，端口不参与——同一 host 的测试 stub 不换会话）。
-fn host_of(base: &str) -> String {
-    base.trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or(base)
-        .split(':')
-        .next()
-        .unwrap_or(base)
-        .to_string()
-}
 
 /// 上下文超限专属判据（§4.14 要点⑤：句式无 context 字样，
 /// harness 认不出，不能靠通用 400 处理）。
@@ -166,49 +279,63 @@ impl GeminiProvider {
         }
     }
 
-    /// sessionId 确定性派生：`(project, 首条 user 文本, lane)` 散列，
-    /// 跨实例稳定（非随机）——同一会话因子命中服务端同一累计桶。
+    /// sessionId 确定性派生（gemini.ts:186-203）：FNV-1a 64（有符号十进制），
+    /// 输入 `project lane firstUserText`（generation>0 再追加 " "+gen）。
+    /// lane 是业务路径字面量：推理 `'infer'` / 冒烟 `'smoke'`（与端点无关）。
     pub fn derive_session_id(project: &str, first_user: &str, lane: &str) -> String {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(project.as_bytes());
-        h.update([0u8]);
-        h.update(first_user.as_bytes());
-        h.update([0u8]);
-        h.update(lane.as_bytes());
-        let hex = format!("{:x}", h.finalize());
-        format!("sess-{}", &hex[..16])
+        Self::derive_session_id_gen(project, first_user, lane, 0)
     }
 
+    pub fn derive_session_id_gen(project: &str, first_user: &str, lane: &str, generation: u32) -> String {
+        let mut input = format!("{project} {lane} {first_user}");
+        if generation > 0 {
+            input.push_str(&format!(" {generation}"));
+        }
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for b in input.bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        (hash as i64).to_string()
+    }
+
+    /// 首条 user 文本口径：构造后 contents[0] 的第一个非空 text part
+    /// （gemini-messages.ts:178-186）。
     fn first_user_text(req: &ChatRequest) -> String {
         req.messages
             .iter()
-            .find(|m| m.role == "user")
-            .map(|m| m.text())
+            .find(|m| m.role != "system")
+            .map(|m| match &m.content {
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .find(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_default(),
+                _ => m.text(),
+            })
             .unwrap_or_default()
     }
 
     /// 会话解析：派生因子变化 → 切换新会话（gen 归零）；返回当前代 sessionId。
     fn current_session_id(&self, project: &str, req: &ChatRequest) -> String {
-        let lane = host_of(&self.base);
-        let base = Self::derive_session_id(project, &Self::first_user_text(req), &lane);
+        let base = Self::derive_session_id(project, &Self::first_user_text(req), "infer");
         let mut s = self.session.lock().unwrap();
         if s.base != base {
             *s = SessionState { base, gen: 0 };
         }
-        format_session(&s)
+        Self::derive_session_id_gen(project, &Self::first_user_text(req), "infer", s.gen)
     }
 
     /// 升代：gen+1 换新 id（服务端按 id 累计，削本地历史无用）。
     fn bump_generation(&self, project: &str, req: &ChatRequest) -> String {
-        let lane = host_of(&self.base);
-        let base = Self::derive_session_id(project, &Self::first_user_text(req), &lane);
+        let base = Self::derive_session_id(project, &Self::first_user_text(req), "infer");
         let mut s = self.session.lock().unwrap();
         if s.base != base {
             *s = SessionState { base, gen: 0 };
         }
         s.gen += 1;
-        format_session(&s)
+        Self::derive_session_id_gen(project, &Self::first_user_text(req), "infer", s.gen)
     }
 
     pub fn production() -> Self {
@@ -392,8 +519,10 @@ impl GeminiProvider {
                     let name = name_map.get(id).ok_or_else(|| {
                         ProviderError::BadRequest(format!("tool_call_id {id} 无对应 tool_use"))
                     })?;
+                    // response 用 content 键（gemini-messages.ts:246-250；
+                    // isError→error:true 的 OpenAI 入口暂无对应标志）
                     parts.push(serde_json::json!({
-                        "functionResponse": { "name": name, "response": { "result": t } }
+                        "functionResponse": { "name": name, "response": { "content": t } }
                     }));
                 }
                 _ => {}
@@ -406,6 +535,17 @@ impl GeminiProvider {
         let mut request = Map::new();
         request.insert("contents".into(), Value::Array(contents));
         let mut generation = Map::new();
+        let max_out = req.raw.get("max_tokens").and_then(Value::as_u64).unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+        generation.insert("maxOutputTokens".into(), Value::from(max_out));
+        let wire = Self::wire_model(&route.model);
+        let tier = wire.rsplit('-').next().unwrap_or("medium");
+        let mut thinking = Map::new();
+        thinking.insert("includeThoughts".into(), Value::Bool(true));
+        let budget = thinking_budget(tier);
+        if budget >= 0 {
+            thinking.insert("thinkingBudget".into(), Value::from(budget));
+        }
+        generation.insert("thinkingConfig".into(), Value::Object(thinking));
         if let Some(t) = req.raw.get("temperature") {
             generation.insert("temperature".into(), t.clone());
         }
@@ -414,7 +554,7 @@ impl GeminiProvider {
         if !system_parts.is_empty() {
             request.insert(
                 "systemInstruction".into(),
-                serde_json::json!({ "parts": [{ "text": system_parts.join("\n\n") }] }),
+                serde_json::json!({ "role": "system", "parts": [{ "text": system_parts.join("\n\n") }] }),
             );
         }
         // OpenAI tools 声明 → functionDeclarations
@@ -426,8 +566,11 @@ impl GeminiProvider {
                 if let Some(n) = f.get("name") {
                     d.insert("name".into(), n.clone());
                 }
+                if let Some(desc) = f.get("description") {
+                    d.insert("description".into(), desc.clone());
+                }
                 if let Some(p) = f.get("parameters") {
-                    d.insert("parameters".into(), p.clone());
+                    d.insert("parameters".into(), sanitize_schema(p));
                 }
                 decls.push(Value::Object(d));
             }
@@ -436,14 +579,26 @@ impl GeminiProvider {
                     "tools".into(),
                     serde_json::json!([{ "functionDeclarations": decls }]),
                 );
+                // tool_choice → toolConfig（仅在有工具时发）
+                if let Some(tc) = build_tool_config(req.raw.get("tool_choice")) {
+                    request.insert("toolConfig".into(), tc);
+                }
             }
         }
         let mut root = Map::new();
         root.insert("model".into(), Value::String(Self::wire_model(&route.model)));
         root.insert("project".into(), Value::String(project.to_string()));
         root.insert("request".into(), Value::Object(request));
-        root.insert("requestId".into(), Value::String(crate::key::random_id(10)));
-        root.insert("userAgent".into(), Value::String(CLIENT_UA.into()));
+        // requestId 形态 agent/{ms}/{8hex}（gemini.ts:400-402）
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        root.insert(
+            "requestId".into(),
+            Value::String(format!("agent/{ms}/{}", crate::key::random_id(4))),
+        );
+        root.insert("userAgent".into(), Value::String(ENVELOPE_UA.into()));
         Ok(alphabetize(&Value::Object(root)))
     }
 
@@ -584,11 +739,17 @@ fn parse_frame(v: &Value) -> FrameData {
             calls.push((name, args.to_string()));
         }
     }
-    let usage = v.get("usageMetadata").map(|u| Usage {
-        prompt_tokens: u.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0),
-        completion_tokens: u.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0),
-        total_tokens: u.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0)
-            + u.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0),
+    let usage = v.get("usageMetadata").map(|u| {
+        let prompt = u.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0);
+        let cached = u.get("cachedContentTokenCount").and_then(Value::as_u64).unwrap_or(0);
+        let completion = u.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0);
+        let total = u.get("totalTokenCount").and_then(Value::as_u64).unwrap_or(0);
+        Usage {
+            // 互斥口径：input 扣除缓存命中（否则双重计费，gemini-messages.ts:499-523）
+            prompt_tokens: prompt.saturating_sub(cached),
+            completion_tokens: completion,
+            total_tokens: total,
+        }
     });
     FrameData { text, calls, sig_events, usage }
 }
