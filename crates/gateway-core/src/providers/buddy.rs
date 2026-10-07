@@ -40,12 +40,23 @@ pub struct BuddyBalance {
 pub struct BuddyProvider {
     base: String,
     domain: String,
+    /// 产品档（buddy 中国版 / workbuddy 国际版仅差这些常量，§4.2-4.3）。
+    product_code: String,
+    product: String,
+    ide_version: String,
     client: reqwest::Client,
 }
 
 impl BuddyProvider {
     pub fn new(base: String) -> Self {
-        Self { base, domain: String::new(), client: reqwest::Client::new() }
+        Self {
+            base,
+            domain: String::new(),
+            product_code: BUDDY_PRODUCT_CODE.into(),
+            product: BUDDY_PRODUCT.into(),
+            ide_version: BUDDY_IDE_VERSION.into(),
+            client: reqwest::Client::new(),
+        }
     }
 
     pub fn production() -> Self {
@@ -55,6 +66,15 @@ impl BuddyProvider {
     /// X-Domain 值可由凭据/产品配置覆盖。
     pub fn with_domain(mut self, domain: String) -> Self {
         self.domain = domain;
+        self
+    }
+
+    /// 产品档覆盖（workbuddy 国际版：`X-Product-Code: workbuddy`、
+    /// pluginVersion 5.5.2——product.ts:459-492，§4.3）。
+    pub fn with_product(mut self, product_code: &str, product: &str, ide_version: &str) -> Self {
+        self.product_code = product_code.into();
+        self.product = product.into();
+        self.ide_version = ide_version.into();
         self
     }
 
@@ -69,14 +89,10 @@ impl BuddyProvider {
 
     /// 推理头族（buddy-adapter.ts:1948-1984）。
     /// X-Domain：**产品优先 `||`**（空串时 `??` 不生效——protocol-wire.md:671-694）。
-    fn headers(cred: &Credential, domain_override: &str) -> Result<reqwest::header::HeaderMap, ProviderError> {
+    fn headers(&self, cred: &Credential) -> Result<reqwest::header::HeaderMap, ProviderError> {
         let v = Self::parse_secret(cred)?;
         let token = Self::sstr(&v, "access_token");
-        let domain = if !domain_override.is_empty() {
-            domain_override
-        } else {
-            &Self::sstr(&v, "domain")
-        };
+        let domain = if !self.domain.is_empty() { self.domain.as_str() } else { &Self::sstr(&v, "domain") };
         let mut h = reqwest::header::HeaderMap::new();
         let ins = reqwest::header::HeaderValue::from_str;
         let _ = ins(&format!("Bearer {token}")).map(|x| h.insert("authorization", x));
@@ -85,11 +101,11 @@ impl BuddyProvider {
         if !domain.is_empty() {
             let _ = ins(domain).map(|x| h.insert("x-domain", x));
         }
-        let _ = ins(BUDDY_PRODUCT_CODE).map(|x| h.insert("x-product-code", x));
-        let _ = ins(BUDDY_PRODUCT).map(|x| h.insert("x-product", x));
+        let _ = ins(&self.product_code).map(|x| h.insert("x-product-code", x));
+        let _ = ins(&self.product).map(|x| h.insert("x-product", x));
         let _ = ins(BUDDY_IDE_NAME).map(|x| h.insert("x-ide-name", x));
         let _ = ins("icube").map(|x| h.insert("x-ide-type", x));
-        let _ = ins(BUDDY_IDE_VERSION).map(|x| h.insert("x-ide-version", x));
+        let _ = ins(&self.ide_version).map(|x| h.insert("x-ide-version", x));
         let _ = ins("conversation").map(|x| h.insert("x-agent-purpose", x));
         Ok(h)
     }
@@ -219,7 +235,7 @@ impl BuddyProvider {
         let resp = self
             .client
             .post(format!("{}{}", self.base, BALANCE_PATH))
-            .headers(Self::headers(cred, &self.domain)?)
+            .headers(self.headers(cred)?)
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -277,16 +293,23 @@ impl BuddyProvider {
             body.insert(k.clone(), v.clone());
         }
         body.insert("model".into(), Value::String(route.model.clone()));
-        body.insert("messages".into(), serde_json::json!(
-            req.messages.iter().map(|m| serde_json::json!({
-                "role": m.role, "content": m.content
-            })).collect::<Vec<_>>()
+        // tool_calls/tool_call_id 必须原样带回（§7.1.2 静默丢弃是最大敌人：
+        // 无名 tool_call 会话报废跨 provider 传染 400）
+        body.insert("messages".into(), Value::Array(
+            req.messages.iter().map(|m| {
+                let mut o = Map::new();
+                o.insert("role".into(), Value::String(m.role.clone()));
+                o.insert("content".into(), m.content.clone());
+                if let Some(tc) = &m.tool_calls { o.insert("tool_calls".into(), tc.clone()); }
+                if let Some(id) = &m.tool_call_id { o.insert("tool_call_id".into(), Value::String(id.clone())); }
+                Value::Object(o)
+            }).collect::<Vec<_>>()
         ));
         body.insert("stream".into(), Value::Bool(true));
         let resp = self
             .client
             .post(format!("{}{}", self.base, CHAT_PATH))
-            .headers(Self::headers(cred, &self.domain)?)
+            .headers(self.headers(cred)?)
             .json(&Value::Object(body))
             .send()
             .await

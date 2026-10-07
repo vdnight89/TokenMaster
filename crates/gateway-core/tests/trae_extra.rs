@@ -36,8 +36,14 @@ struct Cap {
     hits: Vec<(&'static str, Option<HeaderMap>, Option<Value>)>,
     /// ExchangeToken 响应（可切换 401）
     exchange_unauthorized: bool,
+    /// ExchangeToken 自定义响应体（缺省用固定 Result）
+    exchange_body: Option<Value>,
     /// chat 响应队列：None=空 body，Some=事件文本
     chat_bodies: Vec<Option<String>>,
+    /// chat 强制 HTTP 状态（业务码先于状态码用例）
+    chat_forced_status: Option<u16>,
+    /// chat 非 200 时的错误体
+    chat_error_body: Option<String>,
     models_body: Value,
     status_body: Value,
     claim_body: Value,
@@ -55,6 +61,9 @@ async fn stub_exchange(State(cap): State<Arc<Mutex<Cap>>>, h: HeaderMap, req: ax
     if c.exchange_unauthorized {
         return (StatusCode::UNAUTHORIZED, "<html>login expired</html>").into_response();
     }
+    if let Some(body) = c.exchange_body.clone() {
+        return Json(body).into_response();
+    }
     Json(json!({ "Result": {
         "Token": "jwt-new",
         "RefreshToken": "rt-new",
@@ -67,6 +76,10 @@ async fn stub_chat(State(cap): State<Arc<Mutex<Cap>>>, h: HeaderMap) -> Response
     let nth = cap.lock().unwrap().hits.iter().filter(|(k, _, _)| *k == "chat").count();
     recorder(&cap, "chat", &h, None).await;
     let c = cap.lock().unwrap();
+    if let Some(code) = c.chat_forced_status {
+        let body = c.chat_error_body.clone().unwrap_or_default();
+        return (StatusCode::from_u16(code).unwrap(), body).into_response();
+    }
     let body = if nth < c.chat_bodies.len() {
         c.chat_bodies[nth].clone()
     } else {
@@ -330,4 +343,66 @@ async fn catalog_prefers_fetched_models_over_hardcoded_fallback() {
     let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
     assert!(ids.contains(&"glm-5.2") && ids.contains(&"kimi-k3"), "catalog 用缓存：{ids:?}");
     assert_eq!(catalog.id, "trae");
+}
+
+#[tokio::test]
+async fn http_error_body_business_code_precedes_status() {
+    // 业务码先于状态码（trae-errors.ts:96-103 判定顺序）：HTTP 400 但错误体带
+    // {"code":4008} → quota-exceeded 冷却 24h，而不是按 4xx 折 BadRequest。
+    let (base, cap) = spawn().await;
+    {
+        let mut c = cap.lock().unwrap();
+        c.chat_forced_status = Some(400);
+        c.chat_error_body = Some(r#"{"code":4008,"message":"exceeded the quota"}"#.to_string());
+    }
+    let err = pv(base).complete(&cred(), &route(), &req()).await.unwrap_err();
+    match err {
+        ProviderError::RateLimited { retry_after_secs, .. } => {
+            assert_eq!(retry_after_secs, Some(86_400), "4008 先于 HTTP 400：{err:?}")
+        }
+        other => panic!("body 带 4008 须按业务码分类：{other:?}"),
+    }
+    // 非 200 不走空响应重发
+    let chat_hits = cap.lock().unwrap().hits.iter().filter(|(k, _, _)| *k == "chat").count();
+    assert_eq!(chat_hits, 1);
+}
+
+#[tokio::test]
+async fn http_error_body_string_code_also_classified() {
+    // code 的字符串数字形态（readClaimCode 同款口径）同样参与业务码判定
+    let (base, cap) = spawn().await;
+    {
+        let mut c = cap.lock().unwrap();
+        c.chat_forced_status = Some(429);
+        c.chat_error_body = Some(r#"{"code":"4011","message":"frequency limit"}"#.to_string());
+    }
+    match pv(base).complete(&cred(), &route(), &req()).await.unwrap_err() {
+        ProviderError::RateLimited { retry_after_secs, .. } => {
+            assert_eq!(retry_after_secs, Some(60), "4011 冷却 60s（字符串 code 同样参与判定）");
+        }
+        other => panic!("字符串 code 4011 须按业务码分类：{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn exchange_without_expiry_fields_drops_stale_expires_at() {
+    // 三态（TokenExpireAt/Duration）都拿不到 → expires_at 按「未知」删除，
+    // 不得沿用已轮换旧 token 的过期时刻（参考写 ''/JWT exp 兜底）
+    let (base, cap) = spawn().await;
+    cap.lock().unwrap().exchange_body = Some(json!({ "Result": {
+        "Token": "jwt-new2",
+        "RefreshToken": "rt-new2"
+    }}));
+    let mut stale = cred();
+    stale.secret = json!({
+        "access_token": "jwt-old",
+        "refresh_token": "rt-old",
+        "uid": "u-9527",
+        "expires_at": "1000"
+    })
+    .to_string();
+    let out = pv(base).refresh(&stale).await.unwrap();
+    let v: Value = serde_json::from_str(&out.secret).unwrap();
+    assert_eq!(v["access_token"], json!("jwt-new2"));
+    assert!(v.get("expires_at").is_none(), "无过期字段的续期不得保留旧 expires_at：{v}");
 }

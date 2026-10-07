@@ -543,6 +543,9 @@ impl ZcodeProvider {
     /// 提交领取。无 captcha 时先探（3007 → NeedCaptcha）；带 captcha 时先本地
     /// 校验 param（长度 ≥200 + base64 JSON 含 certifyId/securityToken，不合格
     /// 在索要窗口必 3007，不发——zcode-captcha.ts:163-200）。
+    /// 业务码**不挑状态码**：claim 缺/坏 captcha 实测回 `400 + {"code":3007}`
+    /// （zcode-auth.ts:1320「带非法 captcha 与不带 captcha 都回 400/3007」），
+    /// 只认 200 会把先探结果吞成 Upstream，先探后取整个失效。
     pub async fn submit_claim(
         &self,
         cred: &Credential,
@@ -568,13 +571,10 @@ impl ZcodeProvider {
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
         let status = resp.status().as_u16();
         let text = resp.text().await.unwrap_or_default();
-        if status != 200 {
-            return Err(endpoint_error("claim", status, &text));
-        }
-        let v: Value = serde_json::from_str(&text)
-            .map_err(|e| ProviderError::Upstream(format!("claim body: {e}")))?;
+        // 先解析业务码再谈 HTTP 语义（码可能在 400/403 壳里，见方法注释）。
         // 业务码可能是纯数字字符串（{"code":"3012"} 实测出现过——
         // parseZcodeBusinessCode 的教训），不能只认 number。
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let ends_at = || {
             v.pointer("/data/plan/ends_at")
                 .and_then(|x| {
@@ -584,9 +584,13 @@ impl ZcodeProvider {
                 })
                 .unwrap_or_default()
         };
-        match biz_code_of(&v) {
-            Some(0) => Ok(ClaimOutcome::Claimed { ends_at: ends_at() }),
-            Some(1003) => Ok(ClaimOutcome::AlreadyClaimed),
+        // 无码但正文表达风控 ⇒ 归一成 3012（只在码缺失时兜底，绝不覆盖权威码
+        // ——claimZcodePlan 的 N1 修复：{"code":1005,"msg":"quota 3012 exceeded"}
+        // 必须仍是 1005）。无码也无非语义词 ⇒ 落回 HTTP 语义。
+        let code = biz_code_of(&v).or_else(|| is_unusual_activity(&text).then_some(3012));
+        match code {
+            Some(0) if status == 200 => Ok(ClaimOutcome::Claimed { ends_at: ends_at() }),
+            Some(1003) if status == 200 => Ok(ClaimOutcome::AlreadyClaimed),
             Some(1005) => Ok(ClaimOutcome::Cooldown { next_at: ends_at() }),
             Some(3007) => Ok(ClaimOutcome::NeedCaptcha),
             Some(3012) => Err(ProviderError::RateLimited {
@@ -597,6 +601,7 @@ impl ZcodeProvider {
                     truncate(&text)
                 ),
             }),
+            _ if status != 200 => Err(endpoint_error("claim", status, &text)),
             Some(code) => Err(ProviderError::Upstream(format!(
                 "claim code {code}: {}",
                 truncate(&text)
@@ -711,6 +716,18 @@ impl ZcodeProvider {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
         let text = resp.text().await.unwrap_or_default();
+        // 风控装在 429 壳里也按风控冷却（30min）且**绝不换腿**（adapter 分支 ④：
+        // 3012 重试会加重冷却惩罚）。is_unusual_activity 先信业务码——
+        // `{"code":1005,"msg":"quota 3012 exceeded"}` 仍是 1005，照常换腿。
+        if is_unusual_activity(&text) {
+            return Ok(Err(ProviderError::RateLimited {
+                retry_after_secs: Some(IDENTITY_COOLDOWN_SECS),
+                msg: format!(
+                    "identity/risk-control blocked (3012); do not retry aggressively: {}",
+                    truncate(&text)
+                ),
+            }));
+        }
         let quota_like = text.contains("1005") || text.contains("1113");
         if quota_like && channel_available(other, &zc) {
             // 换腿重发一次（不重产 captcha——param 一次性，这里本就不带）；
@@ -1032,7 +1049,8 @@ impl ZcodeStreamState {
             }
             Some("content_block_stop") => {
                 // 工具块结束但从未给过参数增量 ⇒ 补一片空参数（OpenAI 面需要
-                // 至少一片才能拼出 tool_calls；空参数在收尾聚合时补 "{}"）。
+                // 至少一片才能拼出 tool_calls）。参数给 "{}"（zcode-anthropic.ts:764
+                // 同款：完全空的参数补 "{}"，空串不是合法 JSON）。
                 let index = v.get("index").and_then(Value::as_u64).unwrap_or(0);
                 if let Some(entry) = self.tools.get_mut(&index) {
                     if !entry.emitted && !entry.name.is_empty() {
@@ -1044,7 +1062,7 @@ impl ZcodeStreamState {
                             index: openai_index,
                             id: (!entry.id.is_empty()).then(|| entry.id.clone()),
                             name: Some(entry.name.clone()),
-                            arguments: String::new(),
+                            arguments: "{}".to_string(),
                         }));
                     }
                 }
@@ -1613,7 +1631,9 @@ impl ZcodeProvider {
     }
 
     /// 通道化请求头：start-plan 原样；coding-plan 换 Bearer key 并**删
-    /// HTTP-Referer**（transport.ts:126）。
+    /// HTTP-Referer**（transport.ts:126）。缺 token 时**不带 Authorization**
+    /// 而不是发 `Bearer `（transport.ts buildChannelRequest：「缺 key 时不返回
+    /// Authorization，而不是抛错」——调用方据此判不可用/换腿）。
     fn identity_headers_for(
         &self,
         zc: &ZcodeCred,
@@ -1621,15 +1641,26 @@ impl ZcodeProvider {
     ) -> reqwest::header::HeaderMap {
         let mut h = self.identity_headers_raw(zc);
         match channel {
-            ZcodeChannel::StartPlan => {}
+            ZcodeChannel::StartPlan => {
+                if zc.zcode_jwt.is_empty() {
+                    h.remove("authorization");
+                }
+            }
             ZcodeChannel::CodingPlan => {
-                let key = zc
+                match zc
                     .coding_plan_key_zai
                     .as_deref()
                     .or(zc.coding_plan_key_bigmodel.as_deref())
-                    .unwrap_or_default();
-                let _ = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
-                    .map(|v| h.insert("authorization", v));
+                    .filter(|k| !k.is_empty())
+                {
+                    Some(key) => {
+                        let _ = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+                            .map(|v| h.insert("authorization", v));
+                    }
+                    None => {
+                        h.remove("authorization");
+                    }
+                }
                 h.remove("http-referer");
             }
         }
@@ -1746,7 +1777,7 @@ fn pick_org_project(customer: &Value) -> Option<(String, String)> {
         let org_is_default = o
             .get("organizationName")
             .and_then(Value::as_str)
-            .is_some_and(|n| n.contains("默认"));
+            .is_some_and(|n| n.contains("默认机构"));
         let projects: Vec<&Value> = o
             .get("projects")
             .and_then(Value::as_array)
@@ -1758,7 +1789,7 @@ fn pick_org_project(customer: &Value) -> Option<(String, String)> {
         let default_proj = projects.iter().find(|p| {
             p.get("projectName")
                 .and_then(Value::as_str)
-                .is_some_and(|n| n.contains("默认"))
+                .is_some_and(|n| n.contains("默认项目"))
         });
         let chosen = default_proj
             .copied()

@@ -19,7 +19,7 @@ use crate::registry::{ModelInfo, ProviderCatalog};
 use crate::route::Route;
 use crate::sse::SseParser;
 
-pub const LOOMY_API_BASE: &str = "https://loomyad.xifenn.cn/api/v1";
+pub const LOOMY_API_BASE: &str = "https://loomyad.xunfei.cn/api/v1";
 pub const LOOMY_ACCOUNT_BASE: &str = "https://account.xfinfr.com";
 
 const CHAT_PATH: &str = "/chat/completions";
@@ -145,10 +145,16 @@ impl LoomyProvider {
             body.insert(k.clone(), v.clone());
         }
         body.insert("model".into(), Value::String(route.model.clone()));
-        body.insert("messages".into(), serde_json::json!(
-            req.messages.iter().map(|m| serde_json::json!({
-                "role": m.role, "content": m.content
-            })).collect::<Vec<_>>()
+        // tool_calls/tool_call_id 原样带回（§7.1.2 静默丢弃是最大敌人）
+        body.insert("messages".into(), Value::Array(
+            req.messages.iter().map(|m| {
+                let mut o = Map::new();
+                o.insert("role".into(), Value::String(m.role.clone()));
+                o.insert("content".into(), m.content.clone());
+                if let Some(tc) = &m.tool_calls { o.insert("tool_calls".into(), tc.clone()); }
+                if let Some(id) = &m.tool_call_id { o.insert("tool_call_id".into(), Value::String(id.clone())); }
+                Value::Object(o)
+            }).collect::<Vec<_>>()
         ));
         body.insert("stream".into(), Value::Bool(true));
         let resp = self

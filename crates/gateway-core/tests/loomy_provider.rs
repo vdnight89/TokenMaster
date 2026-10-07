@@ -15,9 +15,18 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use gateway_core::openai::ChatRequest;
 use gateway_core::provider::Provider;
-use gateway_core::providers::loomy::LoomyProvider;
+use gateway_core::providers::loomy::{LoomyProvider, LOOMY_ACCOUNT_BASE, LOOMY_API_BASE};
 use gateway_core::Credential;
 use serde_json::json;
+
+/// 域名回归锁：`loomyad.xunfei.cn`（曾拼写为 xifenn.cn——reference §4.9
+/// endpoint 表：推理/模型/积分 `https://loomyad.xunfei.cn/api/v1`，
+/// 讯飞账号 `https://account.xfinfr.com`——注意两家后缀不同，勿混）。
+#[test]
+fn api_base_domain_matches_reference() {
+    assert_eq!(LOOMY_API_BASE, "https://loomyad.xunfei.cn/api/v1");
+    assert_eq!(LOOMY_ACCOUNT_BASE, "https://account.xfinfr.com");
+}
 
 #[derive(Default)]
 struct Cap {

@@ -302,7 +302,20 @@ impl MinimaxProvider {
     }
 
     /// OpenAI → Anthropic Messages 转换（简化版，对齐 §3.7）。
-    fn to_anthropic_body(route: &Route, req: &ChatRequest) -> Value {
+    /// 图片块**显式抛错不静默丢**（§4.11：目录声明支持但带图请求未实测，
+    /// `text()` 只取文本段——静默丢图是「用户以为模型看到了」事故型）。
+    fn to_anthropic_body(route: &Route, req: &ChatRequest) -> Result<Value, ProviderError> {
+        for m in &req.messages {
+            if let Value::Array(parts) = &m.content {
+                if parts.iter().any(|p| {
+                    p.get("type").and_then(Value::as_str).map(|t| t != "text").unwrap_or(false)
+                }) {
+                    return Err(ProviderError::BadRequest(
+                        "minimax 序列化遇到非文本内容块（图片未实测支持）——显式拒绝，不静默丢弃".into(),
+                    ));
+                }
+            }
+        }
         let mut messages: Vec<Value> = Vec::new();
         let mut system_text: Vec<String> = Vec::new();
         for m in &req.messages {
@@ -329,7 +342,7 @@ impl MinimaxProvider {
         body.insert("messages".into(), Value::Array(messages));
         body.insert("max_tokens".into(), Value::from(4096));
         body.insert("stream".into(), Value::Bool(true));
-        Value::Object(body)
+        Ok(Value::Object(body))
     }
 
     /// 从 Anthropic SSE 响应提取文本/用量。
@@ -380,7 +393,7 @@ impl MinimaxProvider {
         route: &Route,
         req: &ChatRequest,
     ) -> Result<(String, Usage, Option<String>), ProviderError> {
-        let body = Self::to_anthropic_body(route, req);
+        let body = Self::to_anthropic_body(route, req)?;
         let resp = self
             .client
             .post(format!("{}{}", self.agent_base, INFER_PATH))
@@ -416,6 +429,7 @@ impl Provider for MinimaxProvider {
             models: vec![
                 ModelInfo { id: "MiniMax-M3.1-Flash-Preview".into() },
                 ModelInfo { id: "MiniMax-M3".into() },
+                ModelInfo { id: "MiniMax-M2.7-highspeed".into() },
                 ModelInfo { id: "MiniMax-M2.7".into() },
             ],
         }

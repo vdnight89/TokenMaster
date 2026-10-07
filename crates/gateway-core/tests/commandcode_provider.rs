@@ -844,3 +844,70 @@ async fn tools_wire_format_bare_fallback_and_defaults() {
     assert_eq!(tools[2]["description"], json!(""));
     assert_eq!(tools[2]["input_schema"], json!({ "type": "object", "properties": {} }), "缺 schema 补空对象骨架");
 }
+
+// ─────────── 校验轮新增回归（对照 proxy.mjs 逐点核对的修复点） ───────────
+
+#[tokio::test]
+async fn empty_string_system_content_skipped_like_null() {
+    // 空串 system 是 JS 假值：跳过不发块，回落到空格占位（proxy.mjs:536-538
+    // `if (m.content)`；修复前会错误地产生 text:"" 块并压制占位符）
+    let (base, cap) = spawn().await;
+    let req: ChatRequest = serde_json::from_value(json!({
+        "model": "commandcode/deepseek/deepseek-v4-flash",
+        "messages": [
+            { "role": "system", "content": "" },
+            { "role": "user", "content": "hi" }
+        ]
+    }))
+    .unwrap();
+    pv(base).complete(&cred(), &route(), &req).await.unwrap();
+    assert_eq!(
+        sent_body(&cap)["params"]["system"],
+        json!([{ "type": "text", "text": " " }]),
+        "空串 system 跳过后走空格占位（issue #17）"
+    );
+}
+
+#[tokio::test]
+async fn upstream_error_reason_trimmed_and_single_separator() {
+    // 正则 `^(?:network|connection|upstream)[-_\s]?error$` 在参考里先 trim+
+    // lowercase 再匹配（proxy.mjs:930-937）：空白包裹的家族词仍算连接类闪断，
+    // 未吐字前可重试
+    let (base, cap) = spawn().await;
+    cap.lock().unwrap().responses = vec![
+        [r#"{"type":"text-delta","text":"半"}"#, r#"{"type":"finish","finishReason":" Connection_Error "}"#]
+            .join("\n"),
+    ];
+    let out = pv(base).complete(&cred(), &route(), &plain_req()).await.unwrap();
+    assert!(out.choices[0].message.content.contains("好"));
+    assert_eq!(cap.lock().unwrap().hits, 2, "空白包裹的 connection-error 仍按闪断重试");
+
+    // 双分隔符不匹配 `[-_\s]?`（至多一个）：未知 reason 原样返回、不重试
+    let (base2, cap2) = spawn().await;
+    cap2.lock().unwrap().ndjson = Some(
+        [
+            r#"{"type":"text-delta","text":"ok"}"#.to_string(),
+            r#"{"type":"finish","finishReason":"network--error","totalUsage":{"inputTokens":3,"outputTokens":2}}"#.to_string(),
+        ]
+        .join("\n"),
+    );
+    let out2 = pv(base2).complete(&cred(), &route(), &plain_req()).await.unwrap();
+    assert_eq!(cap2.lock().unwrap().hits, 1, "双分隔符不属 upstream-error 家族，不得重试");
+    assert_eq!(out2.choices[0].finish_reason.as_deref(), Some("network--error"), "未知值原样不折");
+}
+
+#[tokio::test]
+async fn text_delta_empty_text_falls_back_to_delta_key() {
+    // `event.text || event.delta || ''`：text 为空串（JS 假值）须回退 delta 键
+    // （proxy.mjs:774）
+    let (base, cap) = spawn().await;
+    cap.lock().unwrap().ndjson = Some(
+        [
+            r#"{"type":"text-delta","text":"","delta":"甲"}"#.to_string(),
+            r#"{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":3,"outputTokens":2}}"#.to_string(),
+        ]
+        .join("\n"),
+    );
+    let out = pv(base).complete(&cred(), &route(), &plain_req()).await.unwrap();
+    assert_eq!(out.choices[0].message.content, "甲");
+}

@@ -321,13 +321,20 @@ async fn risk_control_3012_never_switches_channel() {
         )
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, ProviderError::RateLimited { .. }),
-        "3012 原样上抛：{err:?}"
-    );
+    match &err {
+        ProviderError::RateLimited {
+            retry_after_secs, ..
+        } => {
+            assert_eq!(
+                *retry_after_secs,
+                Some(1800),
+                "429 壳里的 3012 也要 30 分钟账号冷却（不是 60s 限流）"
+            );
+        }
+        other => panic!("3012 原样上抛为 RateLimited: {other:?}"),
+    }
     let c = cap.lock().unwrap();
     assert_eq!(c.gen_hits.len(), 1, "风控不换腿（重试加重惩罚）");
-    let _ = err;
 }
 
 #[tokio::test]

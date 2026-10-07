@@ -5,7 +5,8 @@
 //! → `GET /api/v1/zcode-plan/billing/preview?app_version&platform`（带 mid 头；
 //! 量取 entitlements[].grant_units；priority 降序）
 //! → `POST /billing/claim {plan_id}`（验证码头先探后取；本地深校验；
-//! 1003 幂等成功；1005 冷却带 next_at；3007 换 param；3012 风控冷却）。
+//! 1003 幂等成功；1005 冷却带 next_at；3007 换 param——**不挑状态码**，
+//! 实测缺 captcha 回 400+3007；3012 风控冷却，无码时正文短语兜底）。
 
 use std::sync::{Arc, Mutex};
 
@@ -84,8 +85,10 @@ async fn claim(
     }
     let has_captcha = headers.contains_key("x-aliyun-captcha-verify-param");
     if !has_captcha {
+        // 实测形态（zcode-auth.ts:1320）：不带 captcha 回 **400** + code 3007
+        // （校验前置于 plan 校验）——业务码不挑状态码，先探仍要解出 NeedCaptcha。
         return (
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
             Json(json!({ "code": 3007, "message": "captcha required" })),
         )
             .into_response();
@@ -110,6 +113,12 @@ async fn claim(
             Json(
                 json!({ "code": 3012, "msg": "request has been blocked due to unusual activity." }),
             ),
+        )
+            .into_response(),
+        // 无码 + 风控短语（网关换壳形态）：判据要能从正文兜底出 3012（N1 修复）
+        "pnocode" => (
+            StatusCode::FORBIDDEN,
+            "request has been blocked due to unusual activity.".to_string(),
         )
             .into_response(),
         _ => (
@@ -207,6 +216,8 @@ async fn preview_lists_plans_sorted_with_grant_units() {
 
 #[tokio::test]
 async fn claim_without_captcha_returns_need_captcha() {
+    // 先探那发回的是 **400 + {"code":3007}**（zcode-auth.ts:1320 实测）——
+    // 业务码不挑状态码，仍要解出 NeedCaptcha 而不是吞成 Upstream 错误。
     let (base, st) = spawn().await;
     let pv = ZcodeProvider::new(base);
     let out = pv
@@ -279,6 +290,27 @@ async fn claim_3012_maps_to_cooldown_error() {
             retry_after_secs, ..
         } => {
             assert_eq!(*retry_after_secs, Some(1800), "3012 账号冷却 30 分钟");
+        }
+        other => panic!("expect RateLimited, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn claim_without_code_but_risk_phrase_still_cools_down() {
+    // 网关换壳：403 + 纯文本风控短语（无 code 字段）。判据要能从正文兜底出
+    // 3012（claimZcodePlan 的 N1 修复——只在码缺失时兜底，绝不覆盖权威码）。
+    let (base, _) = spawn().await;
+    let pv = ZcodeProvider::new(base);
+    let cap = valid_captcha();
+    let err = pv
+        .submit_claim(&cred(), "pnocode", Some(&cap))
+        .await
+        .unwrap_err();
+    match &err {
+        gateway_core::provider::ProviderError::RateLimited {
+            retry_after_secs, ..
+        } => {
+            assert_eq!(*retry_after_secs, Some(1800), "正文风控短语 → 30 分钟冷却");
         }
         other => panic!("expect RateLimited, got {other:?}"),
     }

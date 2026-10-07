@@ -103,10 +103,16 @@ pub fn is_429_standalone(text: &str) -> bool {
     false
 }
 
-/// 额度用尽判据（`InferHub.4291.200 insufficient quota` 或子串 `4291` + `insufficient quota`）。
+/// 额度用尽判据（§4.1：子串 `4291` **或** `insufficient quota` 文案兜底）。
+/// 注意必须排在 429 判据之前——`4291` 的裸子串含 `429`。
 pub fn is_quota_exhausted(text: &str) -> bool {
-    text.contains("4291") && text.contains("insufficient quota")
-        || text.contains("InferHub.4291")
+    text.contains("4291") || text.to_lowercase().contains("insufficient quota")
+}
+
+/// benefit（免费额度）模型集合（§4.1 模型表；动态 gateway/config ∪ 静态兜底
+/// 中的静态兜底部分——远端 benefit 集合下发属后续接线，当前先静态判定）。
+pub fn is_benefit_model(model: &str) -> bool {
+    matches!(model, "glm-5.3-flash" | "deepseek-v4.1-flash")
 }
 
 /// 排队判据（`TM.00001041` 或 `InferHub.ModelArts.81111.429`）。
@@ -131,55 +137,28 @@ impl Provider for CodeartsProvider {
     }
 
     async fn complete(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChatCompletion, ProviderError> {
-        let (status, body) = self.send(cred, route, req).await?;
-        if status != 200 {
-            return Err(Self::map_error(status, &body));
+        let (text, usage, finish) = self.collect(cred, route, req).await?;
+        let mut out = ChatCompletion::new(route.composite(), text, usage);
+        if let Some(reason) = finish {
+            if reason != "stop" {
+                out.choices[0].finish_reason = Some(reason);
+            }
         }
-        // 标准 OpenAI 非流式
-        let v: Value = serde_json::from_str(&body)
-            .map_err(|e| ProviderError::Upstream(format!("codearts 响应非 JSON: {e}")))?;
-        let content = v.pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let usage = v.get("usage").map(|u| Usage::sum(
-            u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-            u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
-        )).unwrap_or_default();
-        Ok(ChatCompletion::new(route.composite(), content, usage))
+        Ok(out)
     }
 
     async fn stream(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChunkStream, ProviderError> {
-        let (status, body) = self.send(cred, route, req).await?;
-        if status != 200 {
-            return Err(Self::map_error(status, &body));
-        }
-        let mut parser = SseParser::new();
-        parser.feed(body.as_bytes());
-        parser.finalize();
+        let (text, usage, finish) = self.collect(cred, route, req).await?;
         let mut queue: std::collections::VecDeque<Result<StreamChunk, ProviderError>> =
             std::collections::VecDeque::new();
         queue.push_back(Ok(StreamChunk::Role));
-        let mut text = String::new();
-        let mut usage = Usage::default();
-        while let Some(data) = parser.next_data() {
-            if data.trim() == "[DONE]" { break; }
-            if let Ok(v) = serde_json::from_str::<Value>(&data) {
-                if let Some(t) = v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
-                    text.push_str(t);
-                }
-                if let Some(u) = v.get("usage") {
-                    usage = Usage::sum(
-                        u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-                        u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
-                    );
-                }
-            }
-        }
         if !text.is_empty() {
             queue.push_back(Ok(StreamChunk::Content(text)));
         }
-        queue.push_back(Ok(StreamChunk::Finish { reason: "stop".into(), usage }));
+        queue.push_back(Ok(StreamChunk::Finish {
+            reason: finish.unwrap_or_else(|| "stop".into()),
+            usage,
+        }));
         Ok(Box::pin(futures::stream::iter(queue)))
     }
 }
@@ -202,6 +181,60 @@ impl CodeartsProvider {
         v.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
     }
 
+    /// 统一收流：请求恒 `stream:true`，响应两种形态都认
+    /// （SSE 优先；非 SSE 的纯 JSON——错误重定向/网关直答——也能解）。
+    async fn collect(
+        &self,
+        cred: &Credential,
+        route: &Route,
+        req: &ChatRequest,
+    ) -> Result<(String, Usage, Option<String>), ProviderError> {
+        let (status, body) = self.send(cred, route, req).await?;
+        if status != 200 {
+            return Err(Self::map_error(status, &body));
+        }
+        if !body.contains("data:") {
+            // 非流式 JSON
+            let v: Value = serde_json::from_str(&body)
+                .map_err(|e| ProviderError::Upstream(format!("codearts 响应非 JSON: {e}")))?;
+            let content = v.pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let usage = v.get("usage").map(|u| Usage::sum(
+                u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+                u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+            )).unwrap_or_default();
+            let finish = v.pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            return Ok((content, usage, finish));
+        }
+        let mut parser = SseParser::new();
+        parser.feed(body.as_bytes());
+        parser.finalize();
+        let mut text = String::new();
+        let mut usage = Usage::default();
+        let mut finish = None;
+        while let Some(data) = parser.next_data() {
+            if data.trim() == "[DONE]" { break; }
+            let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
+            if let Some(t) = v.pointer("/choices/0/delta/content").and_then(Value::as_str) {
+                text.push_str(t);
+            }
+            if let Some(u) = v.get("usage") {
+                usage = Usage::sum(
+                    u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+                    u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+                );
+            }
+            if let Some(fr) = v.pointer("/choices/0/finish_reason").and_then(Value::as_str) {
+                finish = Some(fr.to_string());
+            }
+        }
+        Ok((text, usage, finish))
+    }
+
     async fn send(
         &self,
         cred: &Credential,
@@ -221,15 +254,24 @@ impl CodeartsProvider {
             body.insert(k.clone(), val.clone());
         }
         body.insert("model".into(), Value::String(route.model.clone()));
-        body.insert("messages".into(), serde_json::json!(
-            req.messages.iter().map(|m| serde_json::json!({
-                "role": m.role, "content": m.content
-            })).collect::<Vec<_>>()
+        // tool_calls/tool_call_id 原样带回（§7.1.2 静默丢弃是最大敌人）
+        body.insert("messages".into(), Value::Array(
+            req.messages.iter().map(|m| {
+                let mut o = Map::new();
+                o.insert("role".into(), Value::String(m.role.clone()));
+                o.insert("content".into(), m.content.clone());
+                if let Some(tc) = &m.tool_calls { o.insert("tool_calls".into(), tc.clone()); }
+                if let Some(id) = &m.tool_call_id { o.insert("tool_call_id".into(), Value::String(id.clone())); }
+                Value::Object(o)
+            }).collect::<Vec<_>>()
         ));
         body.insert("stream".into(), Value::Bool(true));
         let payload = Value::Object(body).to_string();
 
-        // SDK-HMAC-SHA256 签名头（固定 host/date/sha256/token + content-type）
+        // SDK-HMAC-SHA256 签名头（固定 host/date/sha256/token + content-type）。
+        // x-security-token 是固定签名头（§4.1 签名头表）——在场必须进签名，
+        // 否则持有临时凭据的请求会被 401 拒。benefit 模型的 `maas_type: benefit`
+        // 同样参与签名（extraSignedHeaders，缺失回 404 model is not registered）。
         use sha2::{Digest, Sha256};
         let now = chrono_like_now();
         let payload_hash = {
@@ -244,12 +286,18 @@ impl CodeartsProvider {
             .next()
             .unwrap_or("");
         let ph = payload_hash.clone();
-        let signed_headers = vec![
+        let mut signed_headers = vec![
             ("content-type".to_string(), "application/json".to_string()),
             ("host".to_string(), host.to_string()),
             ("x-sdk-content-sha256".to_string(), ph),
             ("x-sdk-date".to_string(), now.clone()),
         ];
+        if !token.is_empty() {
+            signed_headers.push(("x-security-token".to_string(), token.clone()));
+        }
+        if is_benefit_model(&route.model) {
+            signed_headers.push(("maas_type".to_string(), "benefit".to_string()));
+        }
         let auth = sdk_hmac_sha256_sign("POST", CHAT_PATH, "", &signed_headers, payload.as_bytes(), &sk, &ak);
 
         let mut h = reqwest::header::HeaderMap::new();
@@ -261,9 +309,16 @@ impl CodeartsProvider {
         if !token.is_empty() {
             let _ = ins(&token).map(|x| h.insert("x-security-token", x));
         }
-        // 签名后追加（不进签名）
+        if is_benefit_model(&route.model) {
+            let _ = ins("benefit").map(|x| h.insert("maas_type", x));
+        }
+        // 签名后追加（不进签名）：Agent-Type/X-Language（积分侧实测进签名则 401
+        // APIG.0301）+ Chat-Id/Session-Id/lang（llm-adapter.ts:1205-1208）
         let _ = ins("PromptCenter").map(|x| h.insert("agent-type", x));
         let _ = ins("zh-cn").map(|x| h.insert("x-language", x));
+        let _ = ins(&crate::key::random_id(16)).map(|x| h.insert("chat-id", x));
+        let _ = ins(&crate::key::random_id(16)).map(|x| h.insert("session-id", x));
+        let _ = ins("en").map(|x| h.insert("lang", x));
 
         let resp = self
             .client

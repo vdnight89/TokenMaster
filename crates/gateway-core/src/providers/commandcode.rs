@@ -140,11 +140,13 @@ pub fn map_finish_reason(r: &str) -> String {
 
 /// `network-error` / `connection_error` / `upstream-error` 家族（正则
 /// `^(?:network|connection|upstream)[-_\s]?error$`）→ 可重试上游错误。
+/// 参考在 mapFinishReason 里先 trim+lowercase 再套正则（proxy.mjs:930-937），
+/// `[-_\s]?` 是**至多一个**分隔符（`network--error` 不匹配）。
 fn is_upstream_error_reason(r: &str) -> bool {
-    let lower = r.to_lowercase();
+    let lower = r.trim().to_lowercase();
     for p in ["network", "connection", "upstream"] {
         let Some(rest) = lower.strip_prefix(p) else { continue };
-        let rest = rest.trim_start_matches(['-', '_', ' ', '\t']);
+        let rest = rest.strip_prefix(['-', '_', ' ', '\t', '\r', '\n']).unwrap_or(rest);
         if rest == "error" {
             return true;
         }
@@ -544,7 +546,14 @@ fn parse_ndjson(body: &str) -> NdjsonOut {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
         match v.get("type").and_then(Value::as_str).unwrap_or_default() {
             "text-delta" => {
-                let t = v.get("text").or_else(|| v.get("delta")).and_then(Value::as_str).unwrap_or_default();
+                // `event.text || event.delta || ''`：JS 假值链——text 为空串/非字符串
+                // 都要回退 delta（proxy.mjs:774）
+                let t = v
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| v.get("delta").and_then(Value::as_str))
+                    .unwrap_or_default();
                 out.text.push_str(t);
             }
             "reasoning-delta" => {
@@ -755,7 +764,8 @@ impl CommandcodeProvider {
                 Value::String(t) if !t.is_empty() => {
                     system.push(serde_json::json!({ "type": "text", "text": t }));
                 }
-                Value::Null => {}
+                // 空串与 null 同为 JS 假值：跳过不发块（proxy.mjs:536-538 `if (m.content)`）
+                Value::String(_) | Value::Null => {}
                 other => {
                     // 非字符串非数组非 null 的 content → String 化（proxy.mjs:547-549）
                     system.push(serde_json::json!({ "type": "text", "text": json_to_string(other) }));

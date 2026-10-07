@@ -8,6 +8,11 @@
 //! - **无成长中心**（claimBase/webBase 是占位值）
 //! - UA 国际版 `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`
 
+use async_trait::async_trait;
+use crate::openai::{ChatCompletion, ChatRequest};
+use crate::provider::{ChunkStream, Credential, Provider, ProviderError};
+use crate::registry::ProviderCatalog;
+use crate::route::Route;
 use crate::providers::buddy::BuddyProvider;
 
 pub const WORKBUDDY_API_BASE: &str = "https://www.workbuddy.ai";
@@ -25,14 +30,17 @@ impl WorkbuddyProvider {
     pub fn production() -> Self {
         Self {
             inner: BuddyProvider::new(WORKBUDDY_API_BASE.into())
-                .with_domain(WORKBUDDY_DOMAIN.into()),
+                .with_domain(WORKBUDDY_DOMAIN.into())
+                .with_product(WORKBUDDY_PRODUCT_CODE, "WorkBuddy", WORKBUDDY_PLUGIN_VERSION),
         }
     }
 
     /// 测试注入。
     pub fn with_base(base: String) -> Self {
         Self {
-            inner: BuddyProvider::new(base).with_domain(WORKBUDDY_DOMAIN.into()),
+            inner: BuddyProvider::new(base)
+                .with_domain(WORKBUDDY_DOMAIN.into())
+                .with_product(WORKBUDDY_PRODUCT_CODE, "WorkBuddy", WORKBUDDY_PLUGIN_VERSION),
         }
     }
 
@@ -63,9 +71,3 @@ impl Provider for WorkbuddyProvider {
         self.inner.stream(cred, route, req).await
     }
 }
-
-use async_trait::async_trait;
-use crate::openai::{ChatCompletion, ChatRequest};
-use crate::provider::{ChunkStream, Credential, Provider, ProviderError};
-use crate::registry::ProviderCatalog;
-use crate::route::Route;

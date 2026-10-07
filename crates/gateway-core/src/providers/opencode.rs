@@ -82,7 +82,8 @@ impl OpencodeProvider {
         Self::new(OPENCODE_API_BASE.into())
     }
 
-    /// 五头（无机器指纹——1.18.22 逐行核对）。
+    /// 五头（无机器指纹——1.18.22 逐行核对）：四个 `x-opencode-*` + `User-Agent`
+    /// （**不发** `x-session-affinity`/`X-Session-Id`——那是非 opencode 分支的头）。
     fn headers(cred: &Credential, project_id: &str, session_id: &str) -> reqwest::header::HeaderMap {
         let mut h = reqwest::header::HeaderMap::new();
         let ins = reqwest::header::HeaderValue::from_str;
@@ -91,6 +92,7 @@ impl OpencodeProvider {
         let _ = ins(session_id).map(|x| h.insert("x-opencode-session", x));
         let _ = ins(&format!("req-{}", crate::key::random_id(8))).map(|x| h.insert("x-opencode-request", x));
         let _ = ins("opencode/1.18.22").map(|x| h.insert("x-opencode-client", x));
+        let _ = ins("opencode/1.18.22").map(|x| h.insert("user-agent", x));
         h
     }
 
@@ -108,10 +110,16 @@ impl OpencodeProvider {
             body.insert(k.clone(), v.clone());
         }
         body.insert("model".into(), Value::String(route.model.clone()));
-        body.insert("messages".into(), serde_json::json!(
-            req.messages.iter().map(|m| serde_json::json!({
-                "role": m.role, "content": m.content
-            })).collect::<Vec<_>>()
+        // tool_calls/tool_call_id 原样带回（§7.1.2 静默丢弃是最大敌人）
+        body.insert("messages".into(), Value::Array(
+            req.messages.iter().map(|m| {
+                let mut o = Map::new();
+                o.insert("role".into(), Value::String(m.role.clone()));
+                o.insert("content".into(), m.content.clone());
+                if let Some(tc) = &m.tool_calls { o.insert("tool_calls".into(), tc.clone()); }
+                if let Some(id) = &m.tool_call_id { o.insert("tool_call_id".into(), Value::String(id.clone())); }
+                Value::Object(o)
+            }).collect::<Vec<_>>()
         ));
         body.insert("stream".into(), Value::Bool(true));
 

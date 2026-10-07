@@ -8,7 +8,7 @@
 //! - 续期：`POST /api/v1/auth/refresh` body `{refreshToken, grantType}`
 //! - 限流三分类：429 Daily free（人类可读时长）/ 429 其它（retry-after→1h）/ 402（不冷却换号）
 //! - 免费模型：`GET /api/v1/ai/cline/recommended-models`（无需认证）`free` 数组
-//! - 余额：`GET /api/v1/users/me`
+//! - 余额：`GET /api/v1/users/{accountId}/balance`
 //! - 客户端头：`HTTP-Referer: https://cline.bot` / `X-Title: Cline` / `X-CLIENT-TYPE: cline-sdk`
 
 use async_trait::async_trait;
@@ -164,10 +164,15 @@ impl ClineProvider {
 
     /// 限流三分类（cline-rate-limit.ts）：
     /// - 429 "Daily free limit reached" → 人类可读时长（`Try again in 19h 39m`）
-    /// - 429 其它 → retry-after 头→报文→1h 兜底
+    /// - 429 其它 → retry-after 头 → 报文 → 1h 兜底，换号
     /// - 402 → 不冷却（等不会恢复），换号
     /// - 403 地域限制（文案识别）→ PermissionDenied
     pub fn classify_cline_error(status: u16, body: &str) -> ProviderError {
+        Self::classify_with_retry_after(status, body, None)
+    }
+
+    /// 带 retry-after 头的分类（头只在 HTTP 层拿得到，收流点把头值传进来）。
+    fn classify_with_retry_after(status: u16, body: &str, retry_after_header: Option<u64>) -> ProviderError {
         let lower = body.to_lowercase();
         if status == 402 {
             // Insufficient credits：不记倒计时（充值才能恢复）
@@ -175,16 +180,20 @@ impl ClineProvider {
         }
         if status == 429 {
             if lower.contains("daily free limit") {
-                // 人类可读时长：解析 "19h 39m" 等
+                // 人类可读时长：解析 "19h 39m" 等（实测无 retry-after 头，
+                // 写死 60 分钟会无限循环）
                 let secs = Self::parse_human_duration(body);
                 return ProviderError::RateLimited {
                     retry_after_secs: secs,
                     msg: format!("daily free limit: {body}"),
                 };
             }
-            // 其它 429：retry-after 头→报文→1h
+            // 其它 429：retry-after 头 → 报文 → 1h 兜底
+            let secs = retry_after_header
+                .or_else(|| Self::parse_human_duration(body))
+                .or(Some(3600));
             return ProviderError::RateLimited {
-                retry_after_secs: Some(3600),
+                retry_after_secs: secs,
                 msg: format!("rate limit: {body}"),
             };
         }
@@ -234,7 +243,7 @@ impl ClineProvider {
         cred: &Credential,
         route: &Route,
         req: &ChatRequest,
-    ) -> Result<(u16, Vec<u8>), ProviderError> {
+    ) -> Result<(u16, Vec<u8>, Option<u64>), ProviderError> {
         // 标准 OpenAI 兼容——直接透传请求体
         let mut body = Map::new();
         for (k, v) in &req.raw {
@@ -260,8 +269,14 @@ impl ClineProvider {
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
         let status = resp.status().as_u16();
+        // retry-after 头（429 其它分类的第一优先级；Daily free 实测无此头）
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok());
         let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
-        Ok((status, bytes))
+        Ok((status, bytes, retry_after))
     }
 
     async fn collect(
@@ -270,10 +285,10 @@ impl ClineProvider {
         route: &Route,
         req: &ChatRequest,
     ) -> Result<(String, Option<Usage>, Option<String>), ProviderError> {
-        let (status, bytes) = self.send(cred, route, req).await?;
+        let (status, bytes, retry_after) = self.send(cred, route, req).await?;
         let text = String::from_utf8_lossy(&bytes).to_string();
         if status != 200 {
-            return Err(Self::classify_cline_error(status, &text));
+            return Err(Self::classify_with_retry_after(status, &text, retry_after));
         }
         // 标准 OpenAI 非流式或流式（SSE）
         if !text.contains("data:") {

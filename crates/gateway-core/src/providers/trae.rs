@@ -929,6 +929,19 @@ fn aggregate(events: Vec<SoloEvent>, status: u16) -> Result<SoloAgg, ProviderErr
     Ok(agg)
 }
 
+/// 从 HTTP 错误体提取结构化业务码（顶层 `code`，数字或数字字符串形态）。
+/// 参考分类的输入是**响应体原文**（classifyTraeError 对 body 做 1005/4008/
+/// 4011 子串判定、业务码先于状态码，trae-errors.ts:80-126）；流内 error 事件
+/// 走结构化 code，HTTP 路径在这里从 JSON 体里取同一字段。
+fn business_code_from_body(body: &str) -> Option<i64> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    match v.get("code") {
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
 async fn send_chat(
     provider: &TraeProvider,
     cred: &Credential,
@@ -971,9 +984,9 @@ impl TraeProvider {
             if s2 == 200 {
                 return Ok(parse_solo_sse(&b2));
             }
-            return Err(classify_trae_error(s2, None, &b2));
+            return Err(classify_trae_error(s2, business_code_from_body(&b2), &b2));
         }
-        Err(classify_trae_error(status, None, &body))
+        Err(classify_trae_error(status, business_code_from_body(&body), &body))
     }
 
     /// 聚合出带 finish 的完整结果（无 done 事件 = 截断，不伪造完成）。
@@ -1145,6 +1158,13 @@ impl TraeProvider {
     fn checkin_headers(&self, cred: &Credential) -> Result<reqwest::header::HeaderMap, ProviderError> {
         let v = parse_secret(&cred.secret)?;
         let uid = secret_str(&v, "uid");
+        if uid.is_empty() {
+            // 设备身份全由 uid 派生：空 uid 会让所有账号共享同一台"设备"，
+            // 直接被「该设备已签到」拦截——对齐参考 postJson 的精确报错
+            return Err(ProviderError::Credential(
+                "trae 凭据缺 uid，无法派生签到设备身份".into(),
+            ));
+        }
         let token = secret_str(&v, "access_token");
         let trace_id = format!("00-{}-01", crate::key::random_id(8));
         let mut h = reqwest::header::HeaderMap::new();
@@ -1278,6 +1298,11 @@ impl TraeProvider {
         obj.insert("refresh_token".into(), Value::String(new_rt));
         if expires_ms > 0 {
             obj.insert("expires_at".into(), Value::String(expires_ms.to_string()));
+        } else {
+            // 三态都拿不到 → 按「未知」处理，删掉旧 token 遗留的过期时刻
+            //（参考写 ''/JWT exp 兜底，语义同为未知；沿用已失效旧 token 的
+            // expires_at 会让续期后的过期判断基于错误数据）
+            obj.remove("expires_at");
         }
         Ok(Credential { secret: out.to_string(), ..cred.clone() })
     }

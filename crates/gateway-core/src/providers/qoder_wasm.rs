@@ -50,6 +50,11 @@ enum HostVal {
     Crypto,
     /// JS Map（requestresult_headers 返回形态）
     Map(Vec<(String, String)>),
+    /// **wasm 内存的活视图**（qoder-wasm.ts:464 `heap().subarray(a, a+e)`）。
+    /// JS 里 subarray 与 wasm 内存共享同一 buffer——`crypto.getRandomValues`
+    /// 等原位填充**写穿回 wasm 内存**；拷贝成 `Bytes` 会让随机数永远到不了
+    /// wasm 侧（密钥派生拿到全零 → Rust panic `unreachable`）。
+    MemView { ptr: u32, len: u32 },
 }
 
 impl HostVal {
@@ -59,10 +64,12 @@ impl HostVal {
     fn is_string(&self) -> bool {
         matches!(self, HostVal::Str(_))
     }
+    /// TS：`typeof v === 'object' && v !== null`——字符串/布尔/undefined/null
+    /// 都不是 object（qoder-wasm.ts:518-520）。
     fn is_object(&self) -> bool {
         matches!(
             self,
-            HostVal::Bytes(_) | HostVal::Str(_) | HostVal::Map(_) | HostVal::GlobalThis | HostVal::Crypto
+            HostVal::Bytes(_) | HostVal::Map(_) | HostVal::GlobalThis | HostVal::Crypto | HostVal::MemView { .. }
         )
     }
 }
@@ -460,7 +467,13 @@ fn link_all(linker: &mut Linker<Ctx>) -> Result<(), WasmError> {
     macro_rules! push_import {
         ($name:literal, $params:expr, $results:expr, $make:expr) => {
             linker
-                .func_new(IMPORT_MODULE, $name, FuncType::new(linker.engine(), $params, $results), $make)
+                .func_new(IMPORT_MODULE, $name, FuncType::new(linker.engine(), $params, $results), |caller: Caller<'_, Ctx>, args: &[Val], results: &mut [Val]| {
+                    if std::env::var_os("QODER_WASM_TRACE").is_some() {
+                        eprintln!("[wasm-import] {} {:?}", $name, args);
+                    }
+                    let make: &dyn Fn(Caller<'_, Ctx>, &[Val], &mut [Val]) -> Result<(), wasmtime::Error> = &$make;
+                    make(caller, args, results)
+                })
                 .map_err(|e| WasmError::Abi(format!("{}: {e}", $name)))?;
         };
     }
@@ -470,7 +483,12 @@ fn link_all(linker: &mut Linker<Ctx>) -> Result<(), WasmError> {
         Ok(())
     });
     push_import!("__wbg_static_accessor_SELF_24f78b6d23f286ea", vec![], vec![i32v.clone()], |mut caller: Caller<'_, Ctx>, _, results| {
-        let idx = caller.data_mut().push(HostVal::Undefined);
+        // TS：`globalThis.self`——Node ≥21 与浏览器里 self === globalThis
+        // （qoder-wasm.ts:510-511）。getrandom 的探测链**先试 self.crypto**：
+        // 把 SELF 断成 Undefined 会让它退到 process/require/msCrypto——在
+        // 本宿主全是 Undefined，最终 "Crypto API unavailable" panic
+        // `unreachable`（实测，wasm backtrace 198/469/340/55/210）。
+        let idx = caller.data_mut().push(HostVal::GlobalThis);
         results[0] = Val::I32(idx as i32);
         Ok(())
     });
@@ -511,7 +529,8 @@ fn link_all(linker: &mut Linker<Ctx>) -> Result<(), WasmError> {
         Ok(())
     });
 
-    // 随机：subarray 直填 + crypto.getRandomValues(视图) + randomFillSync
+    // 随机：subarray 直填 + crypto.getRandomValues(视图) + randomFillSync。
+    // ⚠️ 视图必须**写穿回 wasm 内存**（见 HostVal::MemView）。
     push_import!("__wbg_getRandomValues_d49329ff89a07af1", vec![i32v.clone(), i32v.clone()], vec![], |mut caller: Caller<'_, Ctx>, args, _| {
         let (ptr, len) = (get_i32!(args, 0) as u32, get_i32!(args, 1).max(0) as usize);
         let mem = caller.get_export("memory").and_then(|m| m.into_memory()).ok_or(wasmtime::Error::msg("no memory"))?;
@@ -521,18 +540,44 @@ fn link_all(linker: &mut Linker<Ctx>) -> Result<(), WasmError> {
         Ok(())
     });
     push_import!("__wbg_getRandomValues_c44a50d8cfdaebeb", vec![i32v.clone(), i32v.clone()], vec![], |mut caller: Caller<'_, Ctx>, args, _| {
-        // JS 语义：crypto.getRandomValues(视图) 原位填充——索引不变
+        // JS 语义：crypto.getRandomValues(视图) 原位填充——索引不变。
+        // 视图是 wasm 内存活视图时**写穿回内存**；拷贝 Bytes 才在堆内改。
         let idx = get_i32!(args, 1) as u32;
-        let mut b = match caller.data().val(idx) { HostVal::Bytes(b) => b, _ => return Ok(()) };
-        fill_random(&mut b);
-        caller.data_mut().heap_replace(idx, HostVal::Bytes(b));
+        let target = caller.data().val(idx);
+        match target {
+            HostVal::MemView { ptr, len } => {
+                let mem = caller.get_export("memory").and_then(|m| m.into_memory()).ok_or(wasmtime::Error::msg("no memory"))?;
+                let mut buf = vec![0u8; len as usize];
+                fill_random(&mut buf);
+                mem.write(&mut caller, ptr as usize, &buf).ok();
+            }
+            HostVal::Bytes(_) => {
+                if let HostVal::Bytes(mut b) = caller.data_mut().take(idx) {
+                    fill_random(&mut b);
+                    caller.data_mut().heap_replace(idx, HostVal::Bytes(b));
+                }
+            }
+            _ => {}
+        }
         Ok(())
     });
     push_import!("__wbg_randomFillSync_6c25eac9869eb53c", vec![i32v.clone(), i32v.clone()], vec![], |mut caller: Caller<'_, Ctx>, args, _| {
         let idx = get_i32!(args, 1) as u32;
-        if let HostVal::Bytes(mut b) = caller.data_mut().take(idx) {
-            fill_random(&mut b);
-            let _ = caller.data_mut().push(HostVal::Bytes(b));
+        let target = caller.data().val(idx);
+        match target {
+            HostVal::MemView { ptr, len } => {
+                let mem = caller.get_export("memory").and_then(|m| m.into_memory()).ok_or(wasmtime::Error::msg("no memory"))?;
+                let mut buf = vec![0u8; len as usize];
+                fill_random(&mut buf);
+                mem.write(&mut caller, ptr as usize, &buf).ok();
+            }
+            HostVal::Bytes(_) => {
+                if let HostVal::Bytes(mut b) = caller.data_mut().take(idx) {
+                    fill_random(&mut b);
+                    caller.data_mut().heap_replace(idx, HostVal::Bytes(b));
+                }
+            }
+            _ => {}
         }
         Ok(())
     });
@@ -568,19 +613,45 @@ fn link_all(linker: &mut Linker<Ctx>) -> Result<(), WasmError> {
         Ok(())
     });
     push_import!("__wbg_set_08463b1df38a7e29", vec![i32v.clone(), i32v.clone(), i32v.clone()], vec![i32v.clone()], |mut caller: Caller<'_, Ctx>, args, results| {
+        // JS 语义：`dst.set(src, offset)` **原位改写 dst**（堆索引不变），
+        // 返回值是 undefined（TS pushObject(undefined)）。旧实现 take(dst)
+        // 后 push 新对象——wasm 持有的旧索引变 Undefined。
         let (dst, src, off) = (get_i32!(args, 0) as u32, get_i32!(args, 1) as u32, get_i32!(args, 2).max(0) as usize);
-        let s = match caller.data().val(src) { HostVal::Bytes(b) => b, _ => vec![] };
-        let out = match caller.data_mut().take(dst) {
-            HostVal::Bytes(mut d) => {
+        fn read_val(caller: &mut Caller<'_, Ctx>, idx: u32) -> Vec<u8> {
+            match caller.data().val(idx) {
+                HostVal::Bytes(b) => b,
+                HostVal::MemView { ptr, len } => {
+                    let mut buf = vec![0u8; len as usize];
+                    if let Some(mem) = caller.get_export("memory").and_then(|m| m.into_memory()) {
+                        let _ = mem.read(&mut *caller, ptr as usize, &mut buf);
+                    }
+                    buf
+                }
+                _ => vec![],
+            }
+        }
+        let s = read_val(&mut caller, src);
+        let dst_val = caller.data().val(dst);
+        match dst_val {
+            HostVal::MemView { ptr, len } => {
+                if let Some(mem) = caller.get_export("memory").and_then(|m| m.into_memory()) {
+                    let end = (off + s.len()).min(len as usize);
+                    if off < end {
+                        let _ = mem.write(&mut caller, (ptr as usize) + off, &s[..end - off]);
+                    }
+                }
+            }
+            HostVal::Bytes(_) => {
+                let mut d = read_val(&mut caller, dst);
                 let end = (off + s.len()).min(d.len());
                 if off < d.len() && end > off {
                     d[off..end].copy_from_slice(&s[..end - off]);
                 }
-                HostVal::Bytes(d)
+                caller.data_mut().heap_replace(dst, HostVal::Bytes(d));
             }
-            _ => HostVal::Bytes(s),
-        };
-        let idx = caller.data_mut().push(out);
+            _ => {}
+        }
+        let idx = caller.data_mut().push(HostVal::Undefined);
         results[0] = Val::I32(idx as i32);
         Ok(())
     });
