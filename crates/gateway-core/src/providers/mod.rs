@@ -5,4 +5,6 @@ pub mod commandcode;
 pub mod trae;
 pub mod gemini;
 pub mod qoder;
+#[cfg(feature = "wasm")]
+pub mod qoder_wasm;
 pub mod zcode;
