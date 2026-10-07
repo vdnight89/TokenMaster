@@ -21,5 +21,8 @@ pub mod route;
 pub mod server;
 pub mod sse;
 pub mod store;
+pub mod zcode_pool_import;
+pub mod checkin;
+pub mod proxy_config;
 
 pub use provider::Credential;
