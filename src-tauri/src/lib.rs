@@ -12,6 +12,7 @@ pub const GATEWAY_PORT: u16 = 8787;
 
 struct GatewayState {
     handle: Mutex<Option<GatewayHandle>>,
+    ledger: std::sync::Arc<gateway_core::ledger::Ledger>,
 }
 
 #[tauri::command]
@@ -41,7 +42,10 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        .manage(GatewayState { handle: Mutex::new(None) })
+        .manage(GatewayState {
+            handle: Mutex::new(None),
+            ledger: std::sync::Arc::new(gateway_core::ledger::Ledger::memory()),
+        })
         .manage(CaptchaState { pool: std::sync::Arc::new(gateway_core::captcha_carrier::CaptchaSupplyPool::new()) })
         .on_window_event(|window, event| {
             // 关窗最小化到托盘（不退出）；托盘菜单的「退出」才真正 close
@@ -60,10 +64,11 @@ pub fn run() {
                 model_map: Vec::new(),
                 registry: Default::default(),
             };
-            let handle = tauri::async_runtime::block_on(gateway_core::server::start_full(
+            let handle = tauri::async_runtime::block_on(gateway_core::server::start_with_ledger(
                 config,
                 Vec::new(),
                 Default::default(),
+                Some(state.ledger.clone()),
             ))
             .map_err(|e| format!("gateway start failed: {e}"))?;
             *state.handle.lock().unwrap() = Some(handle);
@@ -82,6 +87,7 @@ pub fn run() {
                 open_captcha_carrier,
                 captcha_param_ready,
                 captcha_carrier_failed,
+                list_logs,
             ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -150,13 +156,59 @@ fn gateway_config() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-fn usage_summary() -> Result<serde_json::Value, String> {
-    // TODO: 从 Ledger 读真数据；暂返回空结构
+fn usage_summary(state: State<GatewayState>) -> Result<serde_json::Value, String> {
+    let ledger = &state.ledger;
+    let today_start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 86400 * 86400;
+    let recent = ledger.recent(500);
+    let today: Vec<_> = recent.iter().filter(|r| r.ts >= today_start).collect();
+    let today_requests = today.len() as u64;
+    let today_tokens: u64 = today.iter().map(|r| r.prompt_tokens + r.completion_tokens).sum();
+    let mut by_provider = serde_json::Map::new();
+    for b in ledger.aggregate_by_provider() {
+        by_provider.insert(b.key.clone(), serde_json::json!({
+            "requests": b.requests, "prompt": b.prompt_tokens, "completion": b.completion_tokens, "failures": b.failures
+        }));
+    }
+    let mut by_model = serde_json::Map::new();
+    for b in ledger.aggregate_by_model() {
+        by_model.insert(b.key.clone(), serde_json::json!({
+            "requests": b.requests, "prompt": b.prompt_tokens, "completion": b.completion_tokens, "failures": b.failures
+        }));
+    }
     Ok(serde_json::json!({
-        "today": { "requests": 0, "tokens": 0 },
-        "byProvider": {},
-        "byModel": {},
+        "today": { "requests": today_requests, "tokens": today_tokens },
+        "byProvider": by_provider,
+        "byModel": by_model,
     }))
+}
+
+#[tauri::command]
+fn list_logs(state: State<GatewayState>, limit: Option<usize>) -> Result<serde_json::Value, String> {
+    let n = limit.unwrap_or(50).min(200);
+    let recent = state.ledger.recent(n);
+    let items: Vec<serde_json::Value> = recent
+        .iter()
+        .rev()
+        .map(|r| {
+            serde_json::json!({
+                "ts": r.ts,
+                "provider": r.provider,
+                "account": r.account_id,
+                "model": r.model,
+                "prompt_tokens": r.prompt_tokens,
+                "completion_tokens": r.completion_tokens,
+                "status": r.status,
+                "ttfb_ms": r.ttfb_ms,
+                "duration_ms": r.duration_ms,
+                "proto": r.proto,
+            })
+        })
+        .collect();
+    Ok(serde_json::Value::Array(items))
 }
 
 // ───────────── T6.3 验证码载体：WebView 子窗口 ─────────────

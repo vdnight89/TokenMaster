@@ -105,3 +105,22 @@ export function useUsage(fallback: UsageData) {
 }
 
 export { isTauri, invoke };
+
+export interface LogEntry {
+  ts: number;
+  provider: string;
+  account: string;
+  model: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  status: number;
+  ttfb_ms: number | null;
+  duration_ms: number;
+  proto: string;
+}
+
+/** 请求日志 */
+export function useLogs(fallback: LogEntry[], limit?: number) {
+  const cmd = limit ? `list_logs ${limit}` : 'list_logs';
+  return useIPCData(cmd, fallback);
+}
