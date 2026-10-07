@@ -42,6 +42,7 @@ pub fn run() {
             None,
         ))
         .manage(GatewayState { handle: Mutex::new(None) })
+        .manage(CaptchaState { pool: std::sync::Arc::new(gateway_core::captcha_carrier::CaptchaSupplyPool::new()) })
         .on_window_event(|window, event| {
             // 关窗最小化到托盘（不退出）；托盘菜单的「退出」才真正 close
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -78,6 +79,9 @@ pub fn run() {
                 list_accounts,
                 gateway_config,
                 usage_summary,
+                open_captcha_carrier,
+                captcha_param_ready,
+                captcha_carrier_failed,
             ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -136,4 +140,50 @@ fn usage_summary() -> Result<serde_json::Value, String> {
         "byProvider": {},
         "byModel": {},
     }))
+}
+
+// ───────────── T6.3 验证码载体：WebView 子窗口 ─────────────
+
+use std::sync::Arc;
+
+struct CaptchaState {
+    pool: Arc<gateway_core::captcha_carrier::CaptchaSupplyPool>,
+}
+
+#[tauri::command]
+fn open_captcha_carrier(app: tauri::AppHandle, _state: State<CaptchaState>) -> Result<(), String> {
+    use tauri::WebviewWindowBuilder;
+    // 已有载体窗口则聚焦
+    if let Some(win) = app.get_webview_window("captcha-carrier") {
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    // 创建隐藏载体窗口（加载 zcode.z.ai origin 让 AliyunCaptcha SDK 在真实 origin 下运行）
+    let win = WebviewWindowBuilder::new(
+        &app,
+        "captcha-carrier",
+        tauri::WebviewUrl::External("https://zcode.z.ai/".parse::<tauri::Url>().map_err(|e| e.to_string())?),
+    )
+    .title("TokenMaster 验证码")
+    .inner_size(420.0, 320.0)
+    .visible(true) // 用户需要看到并操作验证码
+    .resizable(false)
+    .decorations(true)
+    .build()
+    .map_err(|e| format!("创建载体窗口失败：{e}"))?;
+    let _ = win;
+    Ok(())
+}
+
+#[tauri::command]
+fn captcha_param_ready(state: State<CaptchaState>, param: String, region: String) -> Result<(), String> {
+    state.pool.push_param(&param, &region);
+    Ok(())
+}
+
+#[tauri::command]
+fn captcha_carrier_failed(state: State<CaptchaState>) -> Result<serde_json::Value, String> {
+    let backoff = state.pool.record_carrier_failure();
+    Ok(serde_json::json!({ "backoff_secs": backoff.as_secs() }))
 }

@@ -24,5 +24,6 @@ pub mod store;
 pub mod zcode_pool_import;
 pub mod checkin;
 pub mod proxy_config;
+pub mod captcha_carrier;
 
 pub use provider::Credential;

@@ -95,7 +95,7 @@
 | T6.0 | 【用户指定优先】无边框窗口 + 自定义标题栏：`decorations:false` 去掉 Windows 原生标题栏；用 round-02 原型 topbar 的 traffic 三点（红关/黄最小化/绿最大化，hover 显示图标）作为窗控，顶栏整体设为拖拽区（data-tauri-drag-region）、双击切换最大化；保留右侧网关状态芯片与版本号不受拖拽影响；关闭行为遵循"关窗最小化到托盘"设置（T6.1 联动）；截图自查与原型对照 | — | done(托盘联动留T6.1) | T0.3 |
 | T6.1 | 托盘（菜单/tooltip）+ 单实例 + 开机自启 + 关窗最小化 | — | done(single-instance 聚焦/autostart 插件/关窗→hide 托盘不退出) | T0.3 |
 | T6.2 | zcode-pool 导入实现（enc:v1 兼容解析，读其账号目录） | 2 | done(7 测：enc:v1 前缀/secret 合成/解密往返/错密钥失败/目录导入/不存在空/坏 JSON 跳过) | T2.1, T4.1 |
-| T6.3 | 验证码载体：WebView 子窗口按需拉起 + 供应池退避 | 2 | todo | T0.3, T4.1 |
+| T6.3 | 验证码载体：WebView 子窗口按需拉起 + 供应池退避 | 2 | done(CaptchaSupplyPool 退避 30s→60s→120s→300s + CarrierController 拉起回调 + Tauri WebView 子窗口 zcode.z.ai origin) | T0.3, T4.1 |
 | T6.4 | 签到调度（手动 + 可选自动轮询） | 2 | done(4 测：全遍历签到/空注册/汇总/自动轮询开关) | M4 |
 | T6.5 | 出站代理：全局→Provider→账号三级覆盖（http/socks5） | 2 | done(4 测：三级优先/空串禁用/无配置直连/凭据代理读取) | M4 |
 | T6.6 | NSIS 打包（currentUser）+ 版本一致性校验脚本 | — | done(currentUser 安装/中英双语安装界面/displayLanguageSelector) | M5, M6 |
