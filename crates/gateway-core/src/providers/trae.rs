@@ -1,47 +1,64 @@
 //! trae Provider（TRAE SOLO，缝 2）。
 //!
-//! 协议要点（对照 reference/deepseek-harness-codearts.md §4.7）：
-//! - 鉴权头 `traeSOLOHeaders`：`Authorization: Cloud-IDE-JWT <token>` +
-//!   `X-Cloudide-Token`/`X-Ide-Token`（同 token）+ `X-Uid` +
-//!   `X-Device-Type: macos` + `Request-Traffic-Type: prod` +
+//! 协议要点（对照参考 deepseek-harness-codearts/src/trae*.ts）：
+//! - 鉴权头 `traeSOLOHeaders`（trae.ts:204-237）：`Authorization:
+//!   Cloud-IDE-JWT <token>` + `X-Cloudide-Token`/`X-Ide-Token`（同 token）+
+//!   `X-Uid` + `X-Device-Type: macos` + `Request-Traffic-Type: prod` +
 //!   `X-Machine-Id`/`X-Device-Id`（32 hex，登录时一次性生成持久化，
 //!   **machine_id 续期绝不可重生成**）。
+//! - 三域分离（trae-product.ts:182-186）：UG（签到/余额）api.trae.cn、
+//!   OAuth（ExchangeToken）api.trae.com.cn、推理/模型目录
+//!   trae-api-cn.mchost.guru。
 //! - 登录本地回调 `127.0.0.1:18080`（占用自动回退随机端口），回调参数名
 //!   `auth_callback_url`；老流程回传 token（refreshToken/userInfo/userJwt），
 //!   新流程 PKCE（code/authCodeInfo，识别后给精确报错）；userInfo 中文
 //!   昵称双重编码乱码自动回转；展示名用脱敏手机号。
-//! - 余额 `POST /trae/api/v2/pay/ide_user_ent_usage`，body
+//! - 余额 `POST /trae/api/v2/pay/ide_user_ent_usage`（UG 域），body
 //!   `{"require_usage":true,"req_source":2}`（缺 require_usage 则 usage
-//!   恒 0 余额虚高）；余额 = Σ(credits_limit − credits_amount)。
-//! - 失败模式：`4008`（ide_credits 耗尽）与 `1005`（plan 权益不足）→
-//!   冷却+换号。
-//!
-//! ⚠️ **SOLO 推理通道阻塞**（手册概要级、无 wire 样例）：
-//! `transformToSOLOBody` 的完整形状（`function:"solo_work_lite"` 通道名、
-//! `config_name` 模型映射、`tools[].parameters` 字符串化、
-//! `tool_calls.function`→`function_call` 之外的键）、SOLO SSE 事件
-//! （output/token_usage/done/error）的 JSON 载具形态、15 通道白名单逐字表、
-//! `X-App-Id`/`X-Ide-Version`/`X-OS-Version`/`X-Device-Brand` 具体值——
-//! 待用户提供参考实现原文后接线。
+//!   恒 0 余额虚高）；余额 = Σ(credits_limit − credits_amount)，
+//!   `user_entitlement_pack_list` 在**顶层**（trae-credits.ts:330）。
+//! - 失败模式（trae-errors.ts:80-126 + cooldown-table）：1005 → 12h、
+//!   4008 → 24h、4011/429 → 60s、404 → 1h、4001 = 模型不可调用（不换号）、
+//!   401/会话失效标记 → 重登。
+//! - SOLO 推理（trae.ts:1545-1917）：`transformToSOLOBody` + 自定义 SSE
+//!   事件（output/token_usage/done/error）；空响应同账号重发一次；
+//!   已收到任何事件绝不重放（trae-adapter.ts:1280-1289/1694-1699）。
 
 use serde_json::{Map, Value};
 
 use crate::provider::{Credential, ProviderError};
 
+/// UG 域（签到/余额，trae-product.ts:184 TRAE_UG_HOST）。
 pub const DEFAULT_API_BASE: &str = "https://api.trae.cn";
+/// OAuth 域（ExchangeToken/GetUserInfo，trae-product.ts:186 TRAE_OAUTH_HOST
+/// —— 与 UG 域**不同源**，混用会打错服务器）。
+pub const DEFAULT_OAUTH_BASE: &str = "https://api.trae.com.cn";
 /// 推理域（agentHost，trae-product.ts TRAE_AGENT_HOST）。
 pub const DEFAULT_AGENT_BASE: &str = "https://trae-api-cn.mchost.guru";
 const BALANCE_PATH: &str = "/trae/api/v2/pay/ide_user_ent_usage";
 const CHAT_PATH: &str = "/api/agent/v3/llm_utils_chat";
 const CALLBACK_PREFERRED_PORT: u16 = 18080;
 
-// 产品常量（参考实现 trae-product.ts:316-342 实测值）
+// ── Max 模式（1M 上下文）常量（trae.ts:1478-1489）──
+pub const TRAE_MAX_CONTEXT_TOKENS: u64 = 1_000_000;
+/// Max 模式提示词预算（936K：1M 总窗口里留给补全的部分，刻意比总窗口小）。
+pub const TRAE_MAX_PROMPT_TOKENS: u64 = 936_000;
+/// Max 模式输出上限。
+pub const TRAE_MAX_MODE_OUTPUT_TOKENS: u64 = 64_000;
+/// Max 模式的 `mode_type` 取值。
+pub const TRAE_MAX_MODE_TYPE: u64 = 1;
+
+// 产品常量（参考实现 trae-product.ts:314-337 实测值）
 pub const USER_AGENT: &str = "Trae/0.1.52";
 pub const APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
 pub const IDE_VERSION: &str = "0.1.52";
 pub const IDE_VERSION_CODE: &str = "20260811";
 pub const OS_VERSION: &str = "macOS 15.7.4";
 pub const DEVICE_BRAND: &str = "Apple";
+/// OAuth clientId（trae-product.ts:321；ExchangeToken body 与登录 URL 共用）。
+pub const CLIENT_ID: &str = "en1oxy7wnw8j9n";
+/// 登录 URL 的 plugin_version（trae-product.ts:333）。
+pub const PLUGIN_VERSION: &str = "2.3.62834";
 pub const TRAE_FUNCTION: &str = "solo_work_lite";
 pub const TRAE_DEFAULT_MODEL: &str = "glm-5.2";
 /// 单次输出额度安全上限（模型上限实测 64000，客户端索要更高会把上游打 4xx）。
@@ -76,6 +93,45 @@ pub fn derive_rotating_machine_id(base_machine_id: &str, generation: u32) -> Str
     h.update(format!("{base_machine_id}#machine{generation}"));
     let hex = format!("{:x}", h.finalize());
     hex[..32].to_string()
+}
+
+/// 构造把远程会话钉到 **Max 模式**（1M 上下文）的成套 wire 字段
+/// （trae.ts:1508-1525 `traeMaxModeFields`，对齐
+/// Trae2api-cn/trae_remote_client.py:356-397 的 `_max_mode_fields`）。
+///
+/// 实测要点：
+/// - **不能只调大 `max_tokens`**：上游按 `strategy=max` +
+///   `model_auto_selection.strategy=max` 判定「这是一个 Max 会话」，缺了它们
+///   只会被当成普通会话、按 200K 校验，然后拒绝 1M 的输入；
+/// - `context_window_size` / `prompt_max_tokens` / `max_tokens` 三者**成套**
+///   下发，远端按它们做准入校验（只发其中一个等于没发）；
+/// - 只有远端标了 `display_config.max_mode === true` 的模型才能用；给未标记
+///   的模型硬套 Max 参数会被上游拒绝。
+///
+/// TODO(档位元数据): 接线需要逐模型 `display_config.max_mode` /
+/// `context_window_tokens.max` / `model_detail_list[].__max` 的输出上限——
+/// 当前 `ModelInfo` 只有 id，`fetch_models` 尚未暴露这些元数据；接入后应在
+/// `transform_to_solo_body` 里按模型路由决定是否合并本字段（合并发生在
+/// max_tokens 钳制**之后**：Max 会话的输出上限由远端 `__max` 明细声明，
+/// 可能高于 64K 安全线，被钳制覆盖会让 Max 请求失去意义——见
+/// trae-adapter.ts:1077-1092）。
+pub fn trae_max_mode_fields(max_context: u64, output_max: Option<u64>) -> Value {
+    let context = if max_context > 0 { max_context } else { TRAE_MAX_CONTEXT_TOKENS };
+    serde_json::json!({
+        "model_auto_selection": {
+            "strategy": "max",
+            "fallback_to_advance_model": null,
+            "entitlement_id": null,
+        },
+        "model_selection_strategy": "max",
+        "mode_type": TRAE_MAX_MODE_TYPE,
+        "context_window_size": context,
+        "prompt_max_tokens": TRAE_MAX_PROMPT_TOKENS,
+        "max_tokens": match output_max {
+            Some(n) if n > 0 => Value::from(n),
+            _ => Value::from(TRAE_MAX_MODE_OUTPUT_TOKENS),
+        },
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,9 +193,16 @@ fn form_enc(s: &str) -> String {
 }
 
 pub struct TraeProvider {
+    /// UG 域（签到/余额）：api.trae.cn。
     api_base: String,
+    /// OAuth 域（ExchangeToken）：api.trae.com.cn（trae-product.ts:186）。
+    oauth_base: String,
+    /// 推理域（agentHost）。
     agent_base: String,
     client: reqwest::Client,
+    /// 模型目录缓存（fetch_models 成功后填充；catalog() 优先返回缓存，
+    /// 未拉取时回退硬编码单模型）。
+    models_cache: std::sync::Mutex<Option<std::sync::Arc<Vec<crate::registry::ModelInfo>>>>,
 }
 
 impl TraeProvider {
@@ -147,18 +210,30 @@ impl TraeProvider {
         Self::with_agent_base(api_base, DEFAULT_AGENT_BASE.into())
     }
 
-    /// api 域（余额/签到）与推理域（agentHost）分离注入。
+    /// api 域（余额/签到/OAuth）与推理域（agentHost）分离注入。
+    /// 测试用单 stub 时 OAuth 与 UG 共用同一基址。
     pub fn with_agent_base(api_base: String, agent_base: String) -> Self {
-        Self { api_base, agent_base, client: reqwest::Client::new() }
+        let oauth_base = api_base.clone();
+        Self {
+            api_base,
+            oauth_base,
+            agent_base,
+            client: reqwest::Client::new(),
+            models_cache: std::sync::Mutex::new(None),
+        }
     }
 
     pub fn production() -> Self {
-        Self::new(DEFAULT_API_BASE.into())
+        Self {
+            api_base: DEFAULT_API_BASE.into(),
+            oauth_base: DEFAULT_OAUTH_BASE.into(),
+            agent_base: DEFAULT_AGENT_BASE.into(),
+            client: reqwest::Client::new(),
+            models_cache: std::sync::Mutex::new(None),
+        }
     }
 
     /// `traeSOLOHeaders`（推理/IDE 消费共用的鉴权头族）。
-    /// 已载明值照抄；`X-App-Id`/`X-Ide-Version`/`X-OS-Version`/
-    /// `X-Device-Brand` 的具体值手册未载明，占位待 wire 核对。
     pub fn solo_headers(&self, cred: &Credential) -> reqwest::header::HeaderMap {
         Self::solo_headers_with(cred, true, 0)
     }
@@ -204,6 +279,14 @@ impl TraeProvider {
 
     /// 余额：Σ(credits_limit − credits_amount)；body 必须带
     /// `require_usage:true`（缺失则 usage 恒 0 余额虚高）。
+    ///
+    /// 响应形状对照参考 trae-credits.ts:330-389（权威）：
+    /// `user_entitlement_pack_list` 在**顶层**（不在 `data` 下；参考实现
+    /// 直接 `body.user_entitlement_pack_list`）；每条目读
+    /// `entitlement_base_info.quota.credits_limit` 与同条目
+    /// `usage.credits_amount`；`expire_time` 是**秒级**（展示须 ×1000）。
+    /// `credits_limit <= 0` 的包直接跳过（trae-credits.ts:356）——不能让
+    /// 0 上限的包用 usage 拉低总额（服务端清空额度后的残留条目）。
     pub async fn balance(&self, cred: &Credential) -> Result<TraeBalance, ProviderError> {
         let resp = self
             .client
@@ -227,23 +310,26 @@ impl TraeProvider {
         if code != 0 {
             return Err(ProviderError::Upstream(format!("balance code {code}")));
         }
-        // 形状对照参考 trae-credits.ts:330-389：
-        // data.user_entitlement_pack_list[].entitlement_base_info.quota.credits_limit
-        // 与同条目 usage.credits_amount、条目级 expire_time（秒）。
+        // 顶层为权威形状；`data` 包裹形态做宽松回退（两种 wire 只信参考实测的
+        // 顶层，回退仅为容错，不改变主路径）。
         let packs = v
-            .pointer("/data/user_entitlement_pack_list")
+            .get("user_entitlement_pack_list")
             .and_then(Value::as_array)
+            .or_else(|| v.pointer("/data/user_entitlement_pack_list").and_then(Value::as_array))
             .cloned()
             .unwrap_or_default();
         let total: i64 = packs
             .iter()
-            .map(|pack| {
+            .filter_map(|pack| {
                 let limit = pack
                     .pointer("/entitlement_base_info/quota/credits_limit")
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
+                if limit <= 0 {
+                    return None; // credits_limit<=0 的包不计入（trae-credits.ts:356）
+                }
                 let used = pack.pointer("/usage/credits_amount").and_then(Value::as_i64).unwrap_or(0);
-                limit - used
+                Some(limit - used)
             })
             .sum();
         Ok(TraeBalance { total: total.max(0) as u64 })
@@ -251,9 +337,29 @@ impl TraeProvider {
 }
 
 /// 本地回调登录流（老流程 token 透传；新流程 PKCE 精确报错）。
+///
+/// 对照参考 trae-oauth.ts：回调地址 `http://127.0.0.1:{port}/authorize`
+/// （trae.ts:65 TRAE_CALLBACK_PATH；登录页强制回传该路径）；授权 URL 是
+/// **完整 17 参数集**（trae-oauth.ts:99-127）——参数缺失时登录页会
+/// 「永远停在授权中」（既不跳转也不回传）。
 pub struct TraeLoginFlow {
     callback: String,
+    /// 登录时一次性生成的 (machine_id, device_id)——URL 与回调凭据共用
+    /// 同一份（参考在 buildTraeLoginURL 与凭据组装间共享 session）。
+    ids: std::sync::Arc<(String, String)>,
     rx: tokio::sync::oneshot::Receiver<Result<Credential, ProviderError>>,
+}
+
+/// login_trace_id（trae-oauth.ts:71-76）：machine_id+device_id 拼接串的
+/// 尾部 16 字符——回调反查 pending 的唯一凭据。
+fn machine_trace_id(machine_id: &str, device_id: &str) -> String {
+    let joined = format!("{machine_id}{device_id}");
+    let n = joined.len();
+    if n >= 16 {
+        joined[n - 16..].to_string()
+    } else {
+        format!("{joined:0>16}")
+    }
 }
 
 impl TraeLoginFlow {
@@ -269,43 +375,83 @@ impl TraeLoginFlow {
             Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind callback listener"),
         };
         let port = listener.local_addr().unwrap().port();
-        let callback = format!("http://127.0.0.1:{port}");
+        let callback = format!("http://127.0.0.1:{port}/authorize");
         let (tx, rx) = tokio::sync::oneshot::channel();
         let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        // machine_id/device_id 32hex 一次性生成（URL 下发 + 凭据持久化共用；
+        // 续期不可重生成）
+        let ids = std::sync::Arc::new((
+            crate::key::random_id(16),
+            crate::key::random_id(16),
+        ));
+        let ids_for_handler = ids.clone();
         let app = axum::Router::new().route(
-            "/",
+            "/authorize",
             axum::routing::get(
                 move |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| {
                     let tx = tx.clone();
+                    let ids = ids_for_handler.clone();
                     async move {
-                        let jwt = q.get("userJwt").cloned();
-                        let refresh = q.get("refreshToken").cloned();
-                        let user_info = q.get("userInfo").cloned();
-                        let is_new_flow = q.contains_key("code") || q.contains_key("authCodeInfo");
                         let send = |res: Result<Credential, ProviderError>| {
                             if let Some(tx) = tx.lock().unwrap().take() {
                                 let _ = tx.send(res);
                             }
                         };
-                        if let (Some(jwt), Some(refresh)) = (jwt, refresh) {
-                            // 老流程：token 直接回传
+                        // userJwt 是 URL 编码的 JSON {Token, RefreshToken}
+                        // （trae-oauth.ts:291-292）；兼容裸 token 旧形态。
+                        let (jwt_token, jwt_refresh) = match q.get("userJwt").map(String::as_str) {
+                            Some(s) if s.starts_with('{') => {
+                                match serde_json::from_str::<Value>(s) {
+                                    Ok(v) => (
+                                        v.get("Token").and_then(Value::as_str).unwrap_or("").to_string(),
+                                        v.get("RefreshToken").and_then(Value::as_str).unwrap_or("").to_string(),
+                                    ),
+                                    Err(_) => (String::new(), String::new()),
+                                }
+                            }
+                            Some(s) => (s.to_string(), String::new()),
+                            None => (String::new(), String::new()),
+                        };
+                        // refreshToken：query 优先，缺失回退 userJwt.RefreshToken
+                        // （login.sh:165-166 / trae-oauth.ts:294-295）。
+                        let refresh = q
+                            .get("refreshToken")
+                            .cloned()
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| (!jwt_refresh.is_empty()).then(|| jwt_refresh.clone()));
+                        let is_new_flow = q.contains_key("code") || q.contains_key("authCodeInfo");
+                        if let Some(refresh) = refresh {
+                            // 老流程：token 直接回传（参考分支 1 会立即 ExchangeToken
+                            // 换新；此处存回调 token + refresh_token，续期由
+                            // exchange_refresh 承接，语义等价）
                             let mut m = Map::new();
-                            m.insert("access_token".into(), Value::String(jwt));
+                            m.insert("access_token".into(), Value::String(jwt_token.clone()));
                             m.insert("refresh_token".into(), Value::String(refresh));
-                            if let Some(ui) = user_info.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()) {
-                                if let Some(uid) = ui.get("uid").and_then(Value::as_str) {
+                            if let Some(ui) = q.get("userInfo").and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+                                // 权威字段名 UserID/ScreenName/TenantID
+                                // （trae-oauth.ts:286-289），兼容 uid/nickName 旧形态。
+                                let uid = ui
+                                    .get("UserID")
+                                    .or_else(|| ui.get("uid"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                if !uid.is_empty() {
                                     m.insert("uid".into(), Value::String(uid.to_string()));
                                 }
                                 let nick = ui
-                                    .get("nickName")
+                                    .get("ScreenName")
+                                    .or_else(|| ui.get("nickName"))
                                     .or_else(|| ui.get("nickname"))
                                     .and_then(Value::as_str)
                                     .unwrap_or_default();
                                 m.insert("nickname".into(), Value::String(fix_double_encoding(nick)));
+                                if let Some(tenant) = ui.get("TenantID").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                                    m.insert("enterprise_id".into(), Value::String(tenant.to_string()));
+                                }
                             }
-                            // machine_id/device_id 32hex 一次性生成（续期不可重生成）
-                            m.insert("machine_id".into(), Value::String(crate::key::random_id(16)));
-                            m.insert("device_id".into(), Value::String(crate::key::random_id(16)));
+                            let (machine_id, device_id) = &*ids;
+                            m.insert("machine_id".into(), Value::String(machine_id.clone()));
+                            m.insert("device_id".into(), Value::String(device_id.clone()));
                             send(Ok(Credential {
                                 account_id: String::new(),
                                 secret: Value::Object(m).to_string(),
@@ -314,11 +460,11 @@ impl TraeLoginFlow {
                         }
                         if is_new_flow {
                             send(Err(ProviderError::BadRequest(
-                                "trae 新流程（PKCE code/authCodeInfo）暂不支持：请改用老流程（userJwt/refreshToken 回传）重新登录".into(),
+                                "trae 新流程（PKCE code/authCodeInfo）暂不支持：请改用老流程（refreshToken/userJwt 回传）重新登录".into(),
                             )));
                             return (axum::http::StatusCode::BAD_REQUEST, "unsupported new PKCE flow");
                         }
-                        (axum::http::StatusCode::BAD_REQUEST, "missing userJwt/refreshToken")
+                        (axum::http::StatusCode::BAD_REQUEST, "missing refreshToken/userJwt")
                     }
                 },
             ),
@@ -326,16 +472,48 @@ impl TraeLoginFlow {
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("callback serve");
         });
-        Self { callback, rx }
+        Self { callback, ids, rx }
     }
 
-    /// 授权 URL：回调参数名必须是 `auth_callback_url`。
+    /// 授权 URL：**完整 17 参数集**（trae-oauth.ts:105-126）。回调地址参数名
+    /// 必须是 `auth_callback_url`（不是 callback_url/redirect_uri）；缺其余
+    /// 参数登录页会停在授权中（auth_from/login_channel/auth_type/redirect
+    /// 决定走本地回传分支，login_trace_id 是回调反查凭据，x_* 是客户端
+    /// 形态伪装）。
     pub fn authorize_url(&self, login_page: &str) -> String {
-        format!("{login_page}?auth_callback_url={}", form_enc(&self.callback))
+        let (machine_id, device_id) = &*self.ids;
+        let trace = machine_trace_id(machine_id, device_id);
+        format!(
+            "{login_page}\
+             ?login_version=1\
+             &auth_from=solo\
+             &login_channel=native_ide\
+             &plugin_version={PLUGIN_VERSION}\
+             &auth_type=local\
+             &client_id={CLIENT_ID}\
+             &redirect=0\
+             &login_trace_id={trace}\
+             &auth_callback_url={}\
+             &machine_id={machine_id}\
+             &device_id={device_id}\
+             &x_device_id={device_id}\
+             &x_machine_id={machine_id}\
+             &x_device_brand=PC\
+             &x_device_type=PC\
+             &x_os_version=1.0\
+             &x_app_version={IDE_VERSION}\
+             &x_app_type=stable",
+            form_enc(&self.callback)
+        )
     }
 
     pub fn callback_base(&self) -> &str {
         &self.callback
+    }
+
+    /// 登录时生成的设备身份（供调用方随凭据一并持久化展示）。
+    pub fn device_identity(&self) -> (String, String) {
+        (self.ids.0.clone(), self.ids.1.clone()) // (machine_id, device_id)
     }
 
     pub async fn wait_credential(self) -> Result<Credential, ProviderError> {
@@ -351,11 +529,14 @@ use crate::provider::{ChunkStream, Provider, StreamChunk};
 use crate::route::Route;
 use async_trait::async_trait;
 
-/// OpenAI → SOLO 请求体（transformToSOLOBody，trae.ts:1545-1577）：
+/// OpenAI → SOLO 请求体（transformToSOLOBody，trae.ts:1545-1577；
+/// 消息序列化对照 trae-adapter.ts:406-529 serializeTraeMessages）：
 /// stream 恒 true；function=通道名；model→config_name+model 双字段
 /// （`__` 后缀消除）；content 字符串→`[{type:"text"}]`；assistant
 /// tool_calls function→function_call（无 name 剔除、全剔删键）；
 /// tool_choice 归一；tools.parameters 对象→JSON 字符串；max_tokens 钳 64000。
+/// **不写 `reasoning_content` 键**：参考序列化层对输入消息只发
+/// role/content/tool_calls/tool_call_id，思考内容不回传上游。
 pub fn transform_to_solo_body(route: &Route, req: &ChatRequest) -> Value {
     let mut m = req.raw.clone();
     m.remove("stream");
@@ -373,9 +554,8 @@ pub fn transform_to_solo_body(route: &Route, req: &ChatRequest) -> Value {
             }
             _ => {} // null/缺省 → 跳过键（纯 tool_calls assistant）
         }
-        if let Some(r) = &msg.reasoning_content {
-            o.insert("reasoning_content".into(), Value::String(r.clone()));
-        }
+        // 注意：msg.reasoning_content 刻意不序列化（参考 serializeTraeMessages
+        // / transformSOLOMessage 均不写该键；把思考回传上游会污染上下文）。
         if let Some(id) = &msg.tool_call_id {
             o.insert("tool_call_id".into(), Value::String(id.clone()));
         }
@@ -433,7 +613,12 @@ fn normalize_solo_tool_choice(body: &mut Map<String, Value>) {
             }
         }
         Value::Object(v) => {
-            let typ = v.get("type").and_then(Value::as_str).unwrap_or("").to_lowercase();
+            let typ = v
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
             match typ.as_str() {
                 "none" => {
                     body.remove("tool_choice");
@@ -511,11 +696,15 @@ pub struct SoloEvent {
 }
 
 /// 解析整条 SSE 文本：`event:`/`data:` 行配对，空行分发。
+/// 逐行先 trim（对齐参考 consumeSse 的 `line.trim()` / aggregateTraeSSE 的
+/// `line.trimEnd()`）：真实上游可能用 CRLF 行尾，不剥 `\r` 会让事件分隔行
+/// 失效、事件名带 `\r`。
 pub fn parse_solo_sse(text: &str) -> Vec<SoloEvent> {
     let mut out: Vec<SoloEvent> = Vec::new();
     let mut ev_name = String::new();
     let mut data = String::new();
-    for line in text.lines() {
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
         if line.is_empty() {
             push_event(&mut out, &ev_name, &data);
             ev_name.clear();
@@ -610,41 +799,69 @@ fn normalize_solo_tool_calls(calls: &Value) -> Value {
     )
 }
 
-/// trae 错误分类（trae-errors.ts + cooldown-table.ts）：
-/// 会话死亡标记 → 重登；4008 → 24h；1005 → 12h；4011/429 → 60s；
-/// 404 → 1h；5xx → Upstream；其他 4xx → BadRequest。
+/// trae 错误分类（trae-errors.ts:80-126 Classify + trae-cooldown-table.ts）。
+/// 判定顺序与参考一致：**业务码先于状态码**——
+/// 1. 1005 → hard-plan，冷却 12h（参考要求 body 同时含 "plan" 关键词；这里
+///    拿到的是已解析的结构化 code，比子串匹配可靠，不再复刻关键词条件）；
+/// 2. 4008 → quota-exceeded（ide_credits 耗尽），冷却 24h（**先于 4011**：
+///    两者可能同时出现，让较轻的 4011 抢先命中会让耗尽账号 60s 后被重试）；
+/// 3. 4011 → soft-rate，冷却 60s；
+/// 4. 4001 → 模型不可调用（trae-adapter.ts:556-575 实测：只由
+///    `is_custom_model === true` 或模型/通道不匹配触发，与参数格式无关；
+///    换号无意义——换账号也是同一模型被拒，见 isRotatableStreamError 注释）
+///    → BadRequest（不可重试、不冷却）；
+/// 5. HTTP 401 → session-dead（重登）；错误体带失效标记且无结构化 code 时
+///    同样判死（流内 200+`event:error` 场景）；
+/// 6. 429 → 60s；404 → 1h；5xx → Upstream；其余 4xx → BadRequest。
 pub fn classify_trae_error(status: u16, code: Option<i64>, message: &str) -> ProviderError {
+    match code {
+        Some(1005) => {
+            return ProviderError::RateLimited {
+                retry_after_secs: Some(12 * 3600),
+                msg: format!("plan limit (1005): {message}"),
+            }
+        }
+        Some(4008) => {
+            return ProviderError::RateLimited {
+                retry_after_secs: Some(24 * 3600),
+                msg: format!("ide_credits exhausted (4008): {message}"),
+            }
+        }
+        Some(4011) => {
+            return ProviderError::RateLimited {
+                retry_after_secs: Some(60),
+                msg: format!("rate limited (4011): {message}"),
+            }
+        }
+        Some(4001) => {
+            return ProviderError::BadRequest(format!(
+                "model not callable (4001): {message} —— 该模型通常是「仅可见但不可调用」\
+                 的自定义模型（需先在 TRAE IDE 内绑定供应商）或不在当前通道的目录中，\
+                 请改用模型列表中的其它模型"
+            ));
+        }
+        _ => {}
+    }
+    // 会话死亡：401 状态码（参考规则 4，标记词在参考里也只在 401 分支内起作用）；
+    // 结构化 code 缺失时才做标记词兜底（流内 error 事件可能只有 message）。
+    // 注意不检查裸 "401" 子串——"4011" 消息会被它误判成会话死亡。
     let m = message.to_lowercase();
     let session_dead = status == 401
-        || m.contains("login")
-        || m.contains("token 失效")
-        || m.contains("token invalid")
-        || m.contains("session")
-        || m.contains("unauthorized")
-        || m.contains("401");
+        || (code.is_none()
+            && (m.contains("login")
+                || m.contains("token 失效")
+                || m.contains("token invalid")
+                || m.contains("session")
+                || m.contains("unauthorized")));
     if session_dead {
         return ProviderError::Credential(format!("session dead: {message}"));
     }
-    match code {
-        Some(4008) => ProviderError::RateLimited {
-            retry_after_secs: Some(24 * 3600),
-            msg: format!("ide_credits exhausted (4008): {message}"),
-        },
-        Some(1005) => ProviderError::RateLimited {
-            retry_after_secs: Some(12 * 3600),
-            msg: format!("plan limit (1005): {message}"),
-        },
-        Some(4011) => ProviderError::RateLimited {
-            retry_after_secs: Some(60),
-            msg: format!("rate limited (4011): {message}"),
-        },
-        _ => match status {
-            429 => ProviderError::RateLimited { retry_after_secs: Some(60), msg: message.into() },
-            404 => ProviderError::RateLimited { retry_after_secs: Some(3600), msg: format!("not found: {message}") },
-            s if (500..=599).contains(&s) => ProviderError::Upstream(format!("http {s}: {message}")),
-            s if (400..=499).contains(&s) => ProviderError::BadRequest(format!("http {s}: {message}")),
-            _ => ProviderError::Upstream(message.into()),
-        },
+    match status {
+        429 => ProviderError::RateLimited { retry_after_secs: Some(60), msg: message.into() },
+        404 => ProviderError::RateLimited { retry_after_secs: Some(3600), msg: format!("not found: {message}") },
+        s if (500..=599).contains(&s) => ProviderError::Upstream(format!("http {s}: {message}")),
+        s if (400..=499).contains(&s) => ProviderError::BadRequest(format!("http {s}: {message}")),
+        _ => ProviderError::Upstream(message.into()),
     }
 }
 
@@ -656,6 +873,16 @@ struct SoloAgg {
     finish_reason: Option<String>,
 }
 
+/// 聚合 SOLO 事件为单次结果（对照 Go 端 Aggregate / trae.ts:1860-1917）。
+///
+/// 流内 `event:error`：参考实现（trae-adapter.ts:1611-1647）在**未产出任何
+/// 内容**且错误可换号（1005/4008/4011）时才换号重发；已产出内容则如实抛错、
+/// **绝不重放**（防重复计费/重复执行工具）。本实现是缓冲模式（整包读回后
+/// 一次聚合）——遇 error 事件直接 Err 在语义上等价：空响应重试已在
+/// `chat_events` 里以「零可解析事件」为闸（任何事件、含 metadata，都不重放），
+/// 因此 error 事件到达此处时必然已「收到过事件」，Err 即参考的「如实抛错」
+/// 分支；错误发生前已缓冲的增量随 Err 一并丢弃，与参考流式路径抛错时
+/// 已发射 chunk 由上层终止的行为一致。
 fn aggregate(events: Vec<SoloEvent>, status: u16) -> Result<SoloAgg, ProviderError> {
     let mut agg = SoloAgg {
         text: String::new(),
@@ -674,8 +901,11 @@ fn aggregate(events: Vec<SoloEvent>, status: u16) -> Result<SoloAgg, ProviderErr
         if let Some(tcs) = ev.tool_calls {
             if let Some(arr) = tcs.as_array() {
                 for (i, c) in arr.iter().enumerate() {
+                    // index 优先用上游 wire 值（consumeSse 的 wireIndex，
+                    // trae-adapter.ts:1543），缺失时退化为条目序号——跨事件
+                    // 的同名 index 会由网关下游按 index 合并。
                     agg.tool_calls.push((
-                        i as u64,
+                        c.get("index").and_then(Value::as_u64).unwrap_or(i as u64),
                         c.get("id").and_then(Value::as_str).map(str::to_string),
                         c.pointer("/function/name").and_then(Value::as_str).map(str::to_string),
                         c.pointer("/function/arguments")
@@ -719,6 +949,48 @@ async fn send_chat(
     Ok((status, String::from_utf8_lossy(&bytes).to_string()))
 }
 
+impl TraeProvider {
+    /// 发送 chat 并取回事件序列（complete/stream 共用）。
+    ///
+    /// 空响应（HTTP 200 但零可解析事件，含 metadata）→ 同账号重发**一次**；
+    /// 已收到任何事件则绝不重放（trae-adapter.ts:1280-1289/1694-1699：
+    /// 重放会让上游重复计费并可能重复执行工具）。
+    async fn chat_events(
+        &self,
+        cred: &Credential,
+        route: &Route,
+        req: &ChatRequest,
+    ) -> Result<Vec<SoloEvent>, ProviderError> {
+        let (status, body) = send_chat(self, cred, route, req).await?;
+        if status == 200 {
+            let events = parse_solo_sse(&body);
+            if !events.is_empty() {
+                return Ok(events);
+            }
+            let (s2, b2) = send_chat(self, cred, route, req).await?;
+            if s2 == 200 {
+                return Ok(parse_solo_sse(&b2));
+            }
+            return Err(classify_trae_error(s2, None, &b2));
+        }
+        Err(classify_trae_error(status, None, &body))
+    }
+
+    /// 聚合出带 finish 的完整结果（无 done 事件 = 截断，不伪造完成）。
+    async fn chat_aggregate(
+        &self,
+        cred: &Credential,
+        route: &Route,
+        req: &ChatRequest,
+    ) -> Result<SoloAgg, ProviderError> {
+        let agg = aggregate(self.chat_events(cred, route, req).await?, 200)?;
+        if agg.finish_reason.is_none() {
+            return Err(ProviderError::Upstream("no done event (truncated stream)".into()));
+        }
+        Ok(agg)
+    }
+}
+
 #[async_trait]
 impl Provider for TraeProvider {
     fn id(&self) -> &str {
@@ -730,10 +1002,16 @@ impl Provider for TraeProvider {
     }
 
     fn catalog(&self) -> crate::registry::ProviderCatalog {
-        crate::registry::ProviderCatalog {
-            id: "trae".into(),
-            models: vec![crate::registry::ModelInfo { id: "glm-5.2".into() }],
-        }
+        // fetch_models 成功过 → 返回远端目录缓存（参考 TraeAdapter 用
+        // remoteModels 缓存目录，trae-auth.ts:642-652 含 30s TTL）；未拉取时
+        // 回退硬编码单模型（保证 catalog 无凭据也能同步返回）。
+        let cached = self
+            .models_cache
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(vec![crate::registry::ModelInfo { id: TRAE_DEFAULT_MODEL.into() }]));
+        crate::registry::ProviderCatalog { id: "trae".into(), models: (*cached).clone() }
     }
 
     async fn complete(
@@ -742,22 +1020,8 @@ impl Provider for TraeProvider {
         route: &Route,
         req: &ChatRequest,
     ) -> Result<ChatCompletion, ProviderError> {
-        // 空响应（200 零可解析事件，含 metadata）→ 同账号重发一次；
-        // 已收到任何事件则绝不重放（trae-adapter.ts:1280-1289/1694-1699）
-        let (mut status, mut body) = send_chat(self, cred, route, req).await?;
-        if status == 200 && parse_solo_sse(&body).is_empty() {
-            let (s2, b2) = send_chat(self, cred, route, req).await?;
-            status = s2;
-            body = b2;
-        }
-        if status != 200 {
-            return Err(classify_trae_error(status, None, &body));
-        }
-        let agg = aggregate(parse_solo_sse(&body), status)?;
-        let Some(reason) = agg.finish_reason else {
-            // 无 done 事件 = 截断，不伪造完成
-            return Err(ProviderError::Upstream("no done event (truncated stream)".into()));
-        };
+        let agg = self.chat_aggregate(cred, route, req).await?;
+        let reason = agg.finish_reason.unwrap_or_else(|| "stop".into());
         let mut out = ChatCompletion::new(route.composite(), agg.text, agg.usage);
         if !agg.tool_calls.is_empty() {
             let calls: Vec<Value> = agg
@@ -785,19 +1049,8 @@ impl Provider for TraeProvider {
         route: &Route,
         req: &ChatRequest,
     ) -> Result<ChunkStream, ProviderError> {
-        let (mut status, mut body) = send_chat(self, cred, route, req).await?;
-        if status == 200 && parse_solo_sse(&body).is_empty() {
-            let (s2, b2) = send_chat(self, cred, route, req).await?;
-            status = s2;
-            body = b2;
-        }
-        if status != 200 {
-            return Err(classify_trae_error(status, None, &body));
-        }
-        let agg = aggregate(parse_solo_sse(&body), status)?;
-        let Some(reason) = agg.finish_reason else {
-            return Err(ProviderError::Upstream("no done event (truncated stream)".into()));
-        };
+        let agg = self.chat_aggregate(cred, route, req).await?;
+        let reason = agg.finish_reason.unwrap_or_else(|| "stop".into());
         let mut queue: std::collections::VecDeque<Result<StreamChunk, ProviderError>> =
             std::collections::VecDeque::new();
         queue.push_back(Ok(StreamChunk::Role));
@@ -852,9 +1105,24 @@ fn derive_market_user_id(uid: &str) -> String {
     format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
 }
 
-/// 签到 Vscode-Sessionid：派生 64hex（trae.ts:342-345）。
+/// 签到 Vscode-Sessionid：派生 64hex（trae.ts:342-345；盐是 **`sess`**，
+/// 不是 `session`——逐字对照参考 seededStream(userId, 'sess', 32)）。
 fn derive_session_id_hex(uid: &str) -> String {
-    seeded_stream(uid, "session", 32).iter().map(|b| format!("{b:02x}")).collect()
+    seeded_stream(uid, "sess", 32).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 随机 UUIDv4（X-Request-Id 用，trae.ts:386-391 uuidV4 的等价实现：
+/// 版本/变体位改写为 RFC 4122 形态）。
+fn random_uuid_v4() -> String {
+    let hex = crate::key::random_id(16);
+    let bs: Vec<u8> = (0..16)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0))
+        .collect();
+    let mut bs = bs;
+    bs[6] = (bs[6] & 0x0F) | 0x40;
+    bs[8] = (bs[8] & 0x3F) | 0x80;
+    let h: String = bs.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
 
 const CHECKIN_STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
@@ -871,11 +1139,14 @@ pub struct CheckinOutcome {
 impl TraeProvider {
     /// 签到头族（traeCheckinHeaders，trae.ts:281-314）：设备身份按 uid
     /// **确定性派生**（同账号稳定、跨账号互异——同天共用 device_id 会被
-    /// 「该设备已签到」拦截）。
+    /// 「该设备已签到」拦截）；每请求独立 X-Request-Id / X-Tt-Trace-Id。
+    /// 参考还带 `Accept-Encoding: gzip, deflate`——本网关 reqwest 未启用
+    /// gzip 解压特性，声明了却不解压会拿到乱码，故刻意不发。
     fn checkin_headers(&self, cred: &Credential) -> Result<reqwest::header::HeaderMap, ProviderError> {
         let v = parse_secret(&cred.secret)?;
         let uid = secret_str(&v, "uid");
         let token = secret_str(&v, "access_token");
+        let trace_id = format!("00-{}-01", crate::key::random_id(8));
         let mut h = reqwest::header::HeaderMap::new();
         let ins = reqwest::header::HeaderValue::from_str;
         let _ = ins("application/json").map(|x| h.insert("content-type", x));
@@ -892,7 +1163,12 @@ impl TraeProvider {
         let _ = ins("787976").map(|x| h.insert("x-lscbd-aid", x));
         let _ = ins("windows").map(|x| h.insert("x-lscbd-platform", x));
         let _ = ins(IDE_VERSION).map(|x| h.insert("app-version", x));
+        let _ = ins(&trace_id).map(|x| h.insert("x-tt-trace-id", x));
         let _ = ins(&derive_session_id_hex(&uid)).map(|x| h.insert("vscode-sessionid", x));
+        let _ = ins(&random_uuid_v4()).map(|x| h.insert("x-request-id", x));
+        let _ = ins("empty").map(|x| h.insert("sec-fetch-dest", x));
+        let _ = ins("no-cors").map(|x| h.insert("sec-fetch-mode", x));
+        let _ = ins("none").map(|x| h.insert("sec-fetch-site", x));
         Ok(h)
     }
 
@@ -900,6 +1176,8 @@ impl TraeProvider {
     /// 旧值即刻失效**必须立即回写**；expires_at 归一毫秒字符串；
     /// machine_id/device_id/uid/nickname 完全不动。401/403 或 2xx 无
     /// accessToken 为终态（凭据失效时上游回 HTML 错误页，先读文本再 parse）。
+    /// 端点在 **OAuth 域**（api.trae.com.cn，trae-product.ts:186），与 UG 域
+    /// （api.trae.cn）不同源。
     pub async fn exchange_refresh(&self, cred: &Credential) -> Result<Credential, ProviderError> {
         let v = parse_secret(&cred.secret)?;
         let rt = secret_str(&v, "refresh_token");
@@ -913,10 +1191,10 @@ impl TraeProvider {
         let _ = ins(USER_AGENT).map(|x| h.insert("user-agent", x));
         let resp = self
             .client
-            .post(format!("{}{}", self.api_base, EXCHANGE_PATH))
+            .post(format!("{}{}", self.oauth_base, EXCHANGE_PATH))
             .headers(h)
             .json(&serde_json::json!({
-                "ClientID": "en1oxy7wnw8j9n",
+                "ClientID": CLIENT_ID,
                 "RefreshToken": rt,
                 "ClientSecret": "-",
                 "UserID": ""
@@ -937,7 +1215,12 @@ impl TraeProvider {
         }
         let parsed: Value = serde_json::from_str(&text)
             .map_err(|_| ProviderError::Credential("ExchangeToken 响应非 JSON（疑似登录失效 HTML 页）".into()))?;
-        let result = parsed.get("Result").cloned().unwrap_or(parsed);
+        // Result/result 双键（parseTraeExchangeResponse 的 data.Result ?? data.result）
+        let result = parsed
+            .get("Result")
+            .or_else(|| parsed.get("result"))
+            .cloned()
+            .unwrap_or(parsed);
         let g = |names: [&str; 3]| -> Option<String> {
             for n in names {
                 if let Some(s) = result.get(n).and_then(Value::as_str).filter(|s| !s.is_empty()) {
@@ -951,22 +1234,36 @@ impl TraeProvider {
         };
         // rt 轮换：新值为空保留旧值
         let new_rt = g(["RefreshToken", "refreshToken", "refresh_token"]).unwrap_or_else(|| rt.clone());
-        // expires_at 毫秒字符串归一（trae.ts:619-629 三态）
+        // expires_at 毫秒字符串归一（trae.ts:619-629 applyTraeRefresh 三态：
+        // 毫秒直写 / 秒 ×1000 / 相对秒数 now+duration）
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let expire_at = result
-            .get("TokenExpireAt")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let duration = result
-            .get("TokenExpireDuration")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let read_num = |names: [&str; 2]| -> u64 {
+            for n in names {
+                match result.get(n) {
+                    Some(Value::Number(x)) => {
+                        if let Some(u) = x.as_u64() {
+                            return u;
+                        }
+                    }
+                    // 兼容字符串形态的数字（readNumberField 的口径）
+                    Some(Value::String(s)) => {
+                        if let Ok(u) = s.trim().parse::<u64>() {
+                            return u;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            0
+        };
+        let expire_at = read_num(["TokenExpireAt", "tokenExpireAt"]);
+        let duration = read_num(["TokenExpireDuration", "tokenExpireDuration"]);
         let expires_ms = if expire_at > 1_000_000_000_000 {
             expire_at
-        } else if expire_at > 1_000_000_000 {
+        } else if expire_at > 0 {
             expire_at * 1000
         } else if duration > 0 {
             now_ms + duration * 1000
@@ -1002,11 +1299,13 @@ const ALL_FUNCTIONS: [&str; 22] = [
 ];
 
 impl TraeProvider {
-    /// 模型目录（trae-auth.ts:676-711 + trae.ts:1211-1268）：非流式头；
+    /// 模型目录（trae-auth.ts:676-711 + trae.ts:1205-1272）：非流式头；
     /// 白名单通道整组过滤 + 条目三重过滤（usage==chat_completion、
     /// config_switch!=false、!is_invisible_to_user）；同 config_name
-    /// 多通道**后覆盖前**（参考规则 3；规则 1/2 的档位择优在接入档位
-    /// 元数据时补）。
+    /// 多通道**后覆盖前**（参考规则 3；规则 1/2 的档位择优——空档位不
+    /// 覆盖有档位、同有档位取白名单靠前者——需要 `reasoning_effort_config`
+    /// 元数据参与择优且当前 `ModelInfo` 只有 id、择优结果不可观测，
+    /// 接入档位元数据时再补）。成功后写入 catalog 缓存。
     pub async fn fetch_models(
         &self,
         cred: &Credential,
@@ -1060,12 +1359,21 @@ impl TraeProvider {
                 }
             }
         }
+        // catalog() 优先返回远端目录（参考 TraeAdapter.remoteModels 缓存）
+        *self.models_cache.lock().unwrap() = Some(std::sync::Arc::new(out.clone()));
         Ok(out)
     }
 
     /// 签到状态：{checked_in, credits, streak_days}。
+    /// 业务码非 0 视为失败（对照 fetchTraeCheckinStatus 的
+    /// `readClaimCode(body); if (code !== 0) return null`）。
     pub async fn checkin_status(&self, cred: &Credential) -> Result<CheckinOutcome, ProviderError> {
         let v = self.ug_post(cred, CHECKIN_STATUS_PATH).await?;
+        if let Some(code) = read_ug_code(&v) {
+            if code != 0 {
+                return Err(ProviderError::Upstream(format!("checkin status code {code}")));
+            }
+        }
         Ok(CheckinOutcome {
             checked_in: v.get("checked_in").and_then(Value::as_bool).unwrap_or(false),
             credits: v.get("credits").and_then(Value::as_u64),
@@ -1075,27 +1383,31 @@ impl TraeProvider {
 
     /// 签到领取：claim 响应只有 {"code":0} **不含积分数**——须补查
     /// status 取真实 credits/streak_days。9074（人数过多，code 可为字符串）
-    /// 冷却 300s **不换设备**。
+    /// 冷却 300s **不换设备**；1005 → PlanLimit 冷却 12h；其余业务码 →
+    /// BusinessError 冷却 300s（classifyTraeCheckinError，
+    /// trae-credits.ts:74-100）。
     pub async fn checkin_claim(&self, cred: &Credential) -> Result<CheckinOutcome, ProviderError> {
         let v = self.ug_post(cred, CHECKIN_CLAIM_PATH).await?;
-        // code 兼容数字与字符串两种形态
-        let code = match v.get("code") {
-            Some(Value::Number(n)) => n.as_i64(),
-            Some(Value::String(s)) => s.parse::<i64>().ok(),
-            _ => None,
-        };
-        match code {
-            Some(0) => {}
+        match read_ug_code(&v) {
+            Some(0) | None => {}
             Some(9074) => {
                 return Err(ProviderError::RateLimited {
                     retry_after_secs: Some(300),
                     msg: "checkin too many people (9074)：不换设备，冷却后重试".into(),
                 });
             }
-            Some(other) => {
-                return Err(ProviderError::Upstream(format!("checkin code {other}")));
+            Some(1005) => {
+                return Err(ProviderError::RateLimited {
+                    retry_after_secs: Some(12 * 3600),
+                    msg: "checkin plan limit (1005)".into(),
+                });
             }
-            None => {}
+            Some(other) => {
+                return Err(ProviderError::RateLimited {
+                    retry_after_secs: Some(300),
+                    msg: format!("checkin business code {other}"),
+                });
+            }
         }
         // 幂等补查（claim 已签返回 code:0；真实数值在 status）
         self.checkin_status(cred).await
@@ -1117,6 +1429,17 @@ impl TraeProvider {
         }
         serde_json::from_slice(&bytes)
             .map_err(|e| ProviderError::Upstream(format!("ug 响应非 JSON: {e}")))
+    }
+}
+
+/// 读取 UG（签到）业务码，兼容数字与字符串形态（readClaimCode，
+/// trae-credits.ts:127-132：后端在部分网关上以字符串 `"9074"` 返回）。
+/// 键缺失视为成功（0）；存在但解析不出数字按业务失败（-1）。
+fn read_ug_code(v: &Value) -> Option<i64> {
+    match v.get("code") {
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok().or(Some(-1)),
+        _ => None,
     }
 }
 

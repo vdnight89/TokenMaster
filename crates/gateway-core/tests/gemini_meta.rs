@@ -1,8 +1,12 @@
 //! T4.2b gemini 元数据切片（缝 2：stub 上游）。
-//! 行为来源：docs/reference/deepseek-harness-codearts.md §4.14——
-//! - project 动态探测：loadCodeAssist 的 `cloudaicompanionProject`，
+//! 行为来源：gemini-project.ts / gemini-credits.ts——
+//! - project 动态探测：loadCodeAssist 的 `cloudaicompanionProject`（两级取值），
 //!   `aicode-consumers` 只是空兜底；**探测失败 ≠ 探测到空，失败时不发推理**。
-//! - 配额：`/v1internal:retrieveUserQuotaSummary`（请求体空对象 `{}`，不带 project）。
+//! - 配额：`/v1internal:retrieveUserQuotaSummary`，请求体必须带 `project`
+//!   （空对象对部分账号 403 SUBSCRIPTION_REQUIRED）。
+//! - **LCA 与配额固定走 sandbox 端点**（原版 baseFor 路由，gemini-credits.ts:31-33；
+//!   gemini-project.ts:100-106 的探测序也是 sandbox 先、daily 兜底）；
+//!   推理端点轮换序才是 daily 先。
 //! - 探测结果跨请求缓存（一轮账号周期只探一次）。
 
 use std::sync::{Arc, Mutex};
@@ -106,14 +110,14 @@ fn pv(base: String) -> GeminiProvider {
 
 fn req() -> ChatRequest {
     serde_json::from_value(json!({
-        "model": "gemini/gemini-3-pro",
+        "model": "gemini/gemini-3.8-flash",
         "messages": [{ "role": "user", "content": "打招呼" }]
     }))
     .unwrap()
 }
 
 fn route() -> Route {
-    Route { provider: "gemini".into(), model: "gemini-3-pro".into() }
+    Route { provider: "gemini".into(), model: "gemini-3.8-flash".into() }
 }
 
 fn cred() -> Credential {
@@ -184,4 +188,125 @@ async fn quota_unauthorized_maps_to_credential_error() {
     let (base, _) = spawn(LoadMode::Empty, 401).await;
     let err = pv(base).quota_summary(&cred(), "aicode-consumers").await.unwrap_err();
     assert!(matches!(err, ProviderError::Credential(_)), "{err:?}");
+}
+
+/// LCA 与配额固定 sandbox、推理走 daily（baseFor 路由语义，gemini-credits.ts:31-33）。
+/// 双桩：daily 只服务推理并计数；sandbox 只服务 LCA/配额并计数。
+#[tokio::test]
+async fn lca_and_quota_hit_sandbox_while_inference_hits_daily() {
+    #[derive(Default)]
+    struct Counts {
+        daily_gen: usize,
+        daily_meta: usize,
+        sandbox_load: usize,
+        sandbox_quota: usize,
+    }
+    let counts = Arc::new(Mutex::new(Counts::default()));
+
+    let c2 = counts.clone();
+    let daily = axum::Router::new()
+        .route(
+            "/v1internal:streamGenerateContent",
+            post(move |s: axum::extract::State<Arc<Mutex<Counts>>>| async move {
+                s.0.lock().unwrap().daily_gen += 1;
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"好\"}],\"role\":\"model\"}}]}\n\n",
+                )
+            }),
+        )
+        .route(
+            "/v1internal:loadCodeAssist",
+            post(move |s: axum::extract::State<Arc<Mutex<Counts>>>| async move {
+                s.0.lock().unwrap().daily_meta += 1;
+                (StatusCode::INTERNAL_SERVER_ERROR, "must not be called")
+            }),
+        )
+        .route(
+            "/v1internal:retrieveUserQuotaSummary",
+            post(move |s: axum::extract::State<Arc<Mutex<Counts>>>| async move {
+                s.0.lock().unwrap().daily_meta += 1;
+                (StatusCode::INTERNAL_SERVER_ERROR, "must not be called")
+            }),
+        )
+        .with_state(c2);
+    let l1 = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let daily_addr = l1.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l1, daily).await.expect("daily serve") });
+
+    let c3 = counts.clone();
+    let sandbox = axum::Router::new()
+        .route(
+            "/v1internal:loadCodeAssist",
+            post(move |s: axum::extract::State<Arc<Mutex<Counts>>>| async move {
+                s.0.lock().unwrap().sandbox_load += 1;
+                Json(json!({ "cloudaicompanionProject": "proj-sb" }))
+            }),
+        )
+        .route(
+            "/v1internal:retrieveUserQuotaSummary",
+            post(move |s: axum::extract::State<Arc<Mutex<Counts>>>| async move {
+                s.0.lock().unwrap().sandbox_quota += 1;
+                Json(json!({ "windows": [{ "pct": 7 }] }))
+            }),
+        )
+        .with_state(c3);
+    let l2 = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let sandbox_addr = l2.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l2, sandbox).await.expect("sandbox serve") });
+
+    let p = GeminiProvider::new(format!("http://{daily_addr}"), "aicode-consumers".into())
+        .with_sandbox_base(format!("http://{sandbox_addr}"));
+    let out = p.complete(&cred(), &route(), &req()).await.unwrap();
+    assert!(out.choices[0].message.content.contains("好"));
+    let quota = p.quota_summary(&cred(), "proj-sb").await.unwrap();
+    assert_eq!(quota["windows"][0]["pct"], json!(7));
+
+    let c = counts.lock().unwrap();
+    assert_eq!(c.daily_gen, 1, "推理走 daily（轮换序首个）");
+    assert_eq!(c.daily_meta, 0, "LCA/配额不得打 daily");
+    assert_eq!(c.sandbox_load, 1, "LCA 固定 sandbox");
+    assert_eq!(c.sandbox_quota, 1, "配额固定 sandbox");
+}
+
+/// sandbox LCA 失败时兜底探测 daily（gemini-project.ts:142-172 的逐端点循环）。
+#[tokio::test]
+async fn lca_falls_back_to_daily_when_sandbox_fails() {
+    let sb = axum::Router::new().route(
+        "/v1internal:loadCodeAssist",
+        post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "sandbox down") }),
+    );
+    let l1 = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let sb_addr = l1.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l1, sb).await.expect("sb serve") });
+
+    let load_hits = Arc::new(Mutex::new(0usize));
+    let h2 = load_hits.clone();
+    let daily = axum::Router::new()
+        .route(
+            "/v1internal:loadCodeAssist",
+            post(move |s: axum::extract::State<Arc<Mutex<usize>>>| async move {
+                *s.0.lock().unwrap() += 1;
+                Json(json!({ "cloudaicompanionProject": "proj-daily" }))
+            }),
+        )
+        .route(
+            "/v1internal:streamGenerateContent",
+            post(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"好\"}],\"role\":\"model\"}}]}\n\n",
+                )
+            }),
+        )
+        .with_state(h2);
+    let l2 = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let daily_addr = l2.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l2, daily).await.expect("daily serve") });
+
+    let p = GeminiProvider::new(format!("http://{daily_addr}"), "aicode-consumers".into())
+        .with_sandbox_base(format!("http://{sb_addr}"));
+    let out = p.complete(&cred(), &route(), &req()).await.unwrap();
+    assert!(out.choices[0].message.content.contains("好"));
+    assert_eq!(*load_hits.lock().unwrap(), 1, "sandbox 挂了应兜底探测 daily");
 }

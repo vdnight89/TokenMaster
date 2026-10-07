@@ -1,8 +1,10 @@
 //! T4.1a zcode Provider（缝 2：stub 上游）。
-//! 行为来源：docs/reference/deepseek-harness-codearts.md zcode 节——
+//! 行为来源：zcode-adapter.ts:750-818 + zcode-anthropic.ts——
 //! start-plan 通道 POST {base}/api/v1/zcode-plan/anthropic/v1/messages，
 //! Bearer JWT + 身份头（anthropic-version/User-Agent ZCode/x-platform 等）；
-//! 401→Credential；429→RateLimited(Retry-After)。
+//! 请求体：system 抽顶层、tools 扁平 input_schema、tool 历史转 tool_result、
+//! reasoning_effort → output_config.effort（推理信封）；
+//! 401→Credential；429→RateLimited(Retry-After)；400→BadRequest。
 
 use std::sync::{Arc, Mutex};
 
@@ -32,7 +34,9 @@ async fn stub_messages(
     body: axum::extract::Request,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let bytes = axum::body::to_bytes(body.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(body.into_body(), 1 << 20)
+        .await
+        .unwrap();
     let v: Value = serde_json::from_slice(&bytes).unwrap();
     let auth = headers
         .get("authorization")
@@ -43,16 +47,28 @@ async fn stub_messages(
         let mut c = cap.lock().unwrap();
         c.body = Some(v.clone());
         c.auth = Some(auth.clone());
-        c.anthropic_version = headers.get("anthropic-version").and_then(|x| x.to_str().map(str::to_string).ok());
-        c.ua = headers.get("user-agent").and_then(|x| x.to_str().map(str::to_string).ok());
+        c.anthropic_version = headers
+            .get("anthropic-version")
+            .and_then(|x| x.to_str().map(str::to_string).ok());
+        c.ua = headers
+            .get("user-agent")
+            .and_then(|x| x.to_str().map(str::to_string).ok());
     }
     if auth.ends_with("bad") {
-        return (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error": {"code": 1001}}))).into_response();
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({"error": {"code": 1001}})),
+        )
+            .into_response();
     }
     if auth.ends_with("limited") {
         let mut h = HeaderMap::new();
         h.insert("retry-after", "120".parse().unwrap());
-        return (axum::http::StatusCode::TOO_MANY_REQUESTS, h, Json(json!({"error": {"code": 429}})))
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            h,
+            Json(json!({"error": {"code": 429}})),
+        )
             .into_response();
     }
     Json(json!({
@@ -68,9 +84,14 @@ async fn stub_messages(
 async fn spawn_stub() -> (String, Arc<Mutex<Captured>>) {
     let cap = Arc::new(Mutex::new(Captured::default()));
     let app = Router::new()
-        .route("/api/v1/zcode-plan/anthropic/v1/messages", post(stub_messages))
+        .route(
+            "/api/v1/zcode-plan/anthropic/v1/messages",
+            post(stub_messages),
+        )
         .with_state(cap.clone());
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.expect("stub serve") });
     (format!("http://{addr}"), cap)
@@ -78,7 +99,7 @@ async fn spawn_stub() -> (String, Arc<Mutex<Captured>>) {
 
 fn req() -> ChatRequest {
     serde_json::from_value(json!({
-        "model": "zcode/glm-4.7",
+        "model": "zcode/glm-5.3-flash",
         "messages": [
             { "role": "system", "content": "你是编程助手" },
             { "role": "user", "content": "写个函数" }
@@ -88,47 +109,141 @@ fn req() -> ChatRequest {
 }
 
 fn route() -> Route {
-    Route { provider: "zcode".into(), model: "glm-4.7".into() }
+    Route {
+        provider: "zcode".into(),
+        model: "glm-5.3-flash".into(),
+    }
 }
 
 #[tokio::test]
 async fn completes_via_anthropic_protocol_with_identity_headers() {
     let (base, cap) = spawn_stub().await;
     let pv = ZcodeProvider::new(base);
-    let cred = Credential { account_id: "zc-1".into(), secret: "jwt-token".into() };
+    let cred = Credential {
+        account_id: "zc-1".into(),
+        secret: "jwt-token".into(),
+    };
     let out = pv.complete(&cred, &route(), &req()).await.unwrap();
     assert_eq!(out.choices[0].message.content, "zcode 回答");
     assert_eq!(out.usage.prompt_tokens, 33);
     assert_eq!(out.usage.completion_tokens, 7);
-    assert_eq!(out.model, "zcode/glm-4.7");
+    assert_eq!(out.model, "zcode/glm-5.3-flash");
 
     let c = cap.lock().unwrap();
     let body = c.body.as_ref().unwrap();
-    assert_eq!(body["model"], "glm-4.7", "上游收到裸模型名");
-    assert!(body["system"].as_str().unwrap().contains("你是编程助手"), "system 抽到顶层字段");
-    assert_eq!(body["messages"][0]["role"], "user", "消息数组不再含 system 角色");
+    assert_eq!(body["model"], "glm-5.3-flash", "上游收到裸模型名");
+    assert!(
+        body["system"].as_str().unwrap().contains("你是编程助手"),
+        "system 抽到顶层字段"
+    );
+    assert_eq!(
+        body["messages"][0]["role"], "user",
+        "消息数组不再含 system 角色"
+    );
     assert_eq!(body["messages"][0]["content"], "写个函数");
-    assert!(body["max_tokens"].as_u64().unwrap() > 0, "anthropic 协议要求 max_tokens");
+    assert!(
+        body["max_tokens"].as_u64().unwrap() > 0,
+        "anthropic 协议要求 max_tokens"
+    );
     assert_eq!(c.auth.as_deref(), Some("Bearer jwt-token"));
     assert_eq!(c.anthropic_version.as_deref(), Some("2023-06-01"));
-    assert!(c.ua.as_deref().unwrap().starts_with("ZCode/"), "User-Agent 需伪装 ZCode 客户端");
+    assert!(
+        c.ua.as_deref().unwrap().starts_with("ZCode/"),
+        "User-Agent 需伪装 ZCode 客户端"
+    );
 }
 
 #[tokio::test]
-async fn catalog_lists_zcode_models() {
+async fn request_body_carries_tools_tool_history_and_effort_envelope() {
+    // zcode-anthropic.ts：tools 扁平 input_schema；role:tool → user+tool_result；
+    // assistant tool_calls → content tool_use（input 为对象）；
+    // 推理信封 output_config.effort（协议名不是 reasoning_effort）。
+    let (base, cap) = spawn_stub().await;
+    let pv = ZcodeProvider::new(base);
+    let cred = Credential {
+        account_id: "zc-1".into(),
+        secret: "jwt-token".into(),
+    };
+    let req: ChatRequest = serde_json::from_value(json!({
+        "model": "zcode/glm-5.3-flash",
+        "reasoning_effort": "high",
+        "tools": [
+            { "type": "function", "function": {
+                "name": "get_weather", "description": "查天气",
+                "parameters": { "type": "object", "properties": { "city": { "type": "string" } } } } }
+        ],
+        "messages": [
+            { "role": "user", "content": "北京天气" },
+            { "role": "assistant", "content": "", "tool_calls": [
+                { "id": "call_1", "type": "function",
+                  "function": { "name": "get_weather", "arguments": "{\"city\":\"北京\"}" } } ] },
+            { "role": "tool", "tool_call_id": "call_1", "content": "晴" }
+        ]
+    }))
+    .unwrap();
+    pv.complete(&cred, &route(), &req).await.unwrap();
+    let body = cap.lock().unwrap().body.clone().unwrap();
+    // tools：Anthropic 扁平形态（非 OpenAI 嵌套 function）
+    assert_eq!(body["tools"][0]["name"], "get_weather");
+    assert!(
+        body["tools"][0]["input_schema"].is_object(),
+        "input_schema 是对象"
+    );
+    assert!(
+        body["tools"][0].get("function").is_none(),
+        "不得残留 OpenAI 嵌套形态"
+    );
+    // 消息历史：assistant tool_use（input 对象）+ tool 结果包成 user 的 tool_result
+    let msgs = body["messages"].as_array().unwrap();
+    assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
+    assert_eq!(msgs[1]["content"][0]["input"]["city"], "北京");
+    assert_eq!(msgs[2]["role"], "user");
+    assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+    assert_eq!(msgs[2]["content"][0]["tool_use_id"], "call_1");
+    // 推理信封
+    assert_eq!(
+        body["output_config"]["effort"], "high",
+        "reasoning_effort → output_config.effort"
+    );
+    // 未知档位不下发（上游只认声明过的档位）
+    let req_bad: ChatRequest = serde_json::from_value(json!({
+        "model": "zcode/glm-5.3-flash",
+        "reasoning_effort": "ultra",
+        "messages": [{ "role": "user", "content": "hi" }]
+    }))
+    .unwrap();
+    pv.complete(&cred, &route(), &req_bad).await.unwrap();
+    let body2 = cap.lock().unwrap().body.clone().unwrap();
+    assert!(
+        body2.get("output_config").is_none(),
+        "未知档位不下发（会被上游拒）"
+    );
+}
+
+#[tokio::test]
+async fn catalog_lists_channel_models() {
     let pv = ZcodeProvider::new("http://127.0.0.1:1".into());
     assert_eq!(pv.id(), "zcode");
     let catalog = pv.catalog();
     let ids: Vec<String> = catalog.models.iter().map(|m| m.id.clone()).collect();
-    assert!(ids.contains(&"glm-4.7".to_string()));
-    assert!(ids.contains(&"glm-4.7-air".to_string()));
+    // 通道模型并集（transport.ts CHANNEL_MODELS）——glm-4.x 不在上游承载表
+    assert!(ids.contains(&"glm-5.3-flash".to_string()));
+    assert!(ids.contains(&"glm-5.3".to_string()));
+    assert!(ids.contains(&"glm-5.2".to_string()));
+    assert!(
+        !ids.iter().any(|m| m.starts_with("glm-4")),
+        "上游无 glm-4 系模型"
+    );
 }
 
 #[tokio::test]
 async fn unauthorized_maps_to_credential_error() {
     let (base, _) = spawn_stub().await;
     let pv = ZcodeProvider::new(base);
-    let cred = Credential { account_id: "a".into(), secret: "bad".into() };
+    let cred = Credential {
+        account_id: "a".into(),
+        secret: "bad".into(),
+    };
     let err = pv.complete(&cred, &route(), &req()).await.unwrap_err();
     assert!(matches!(err, ProviderError::Credential(_)), "got: {err:?}");
 }
@@ -137,10 +252,15 @@ async fn unauthorized_maps_to_credential_error() {
 async fn rate_limit_maps_retry_after() {
     let (base, _) = spawn_stub().await;
     let pv = ZcodeProvider::new(base);
-    let cred = Credential { account_id: "a".into(), secret: "limited".into() };
+    let cred = Credential {
+        account_id: "a".into(),
+        secret: "limited".into(),
+    };
     let err = pv.complete(&cred, &route(), &req()).await.unwrap_err();
     match err {
-        ProviderError::RateLimited { retry_after_secs, .. } => assert_eq!(retry_after_secs, Some(120)),
+        ProviderError::RateLimited {
+            retry_after_secs, ..
+        } => assert_eq!(retry_after_secs, Some(120)),
         other => panic!("expect RateLimited, got {other:?}"),
     }
 }

@@ -1,18 +1,35 @@
 //! gemini Provider（Google Cloud Code Assist 免费线，Antigravity 客户端身份伪装）。
 //!
 //! 上游：`POST {base}/v1internal:streamGenerateContent?alt=sse`（SSE 帧）。
-//! 协议要点（对照 reference/deepseek-harness-codearts.md §3.6/§4.14）：
+//! 协议要点（对照 deepseek-harness-codearts gemini*.ts，参考为权威）：
 //! - 双层信封**每层键字母序**（Go map 序列化语义；serde_json preserve_order 下
 //!   显式按序重建，`alphabetize`）。
 //! - 五个身份头**写死**（x-machine-id/x-vscode-sessionid 是占位串，不生成随机值）；
 //!   流式请求刻意不带 `Accept`；不发 `x-goog-api-key`。
 //! - 模型名是准入键：必须带 `-low/-medium/-high/-tiered` 档位后缀，
-//!   对外只暴露主名，出站默认补 `-medium`。
+//!   对外只暴露主名，出站默认补 `-medium`；未知主名**本地拒绝**
+//!   （gemini.ts:537-546：上游对未知名静默回落 3.8，用户拿到错误模型的答案
+//!   且无任何征兆，比报错难查得多）。
 //! - system 抽到顶层 `systemInstruction`；assistant 角色 → `model`。
+//! - SSE 帧可能是 `{"response":{…}}` 信封**或**裸 `Response`（先试信封再试裸，
+//!   gemini-messages.ts:634-637）；`candidates` 为空的帧是纯 usage 收尾帧，
+//!   只记用量不算内容；usage 取「见过的最大 totalTokenCount 的那一份」
+//!   （上游多帧重复播报，早期帧偏小，gemini-messages.ts:705-712）。
+//! - 端点轮换：推理 daily 先、sandbox 兜底（429/403/404/可切换 400 时换一次，
+//!   gemini.ts:75 / gemini-adapter.ts:690-711）；loadCodeAssist 与配额**固定走
+//!   sandbox**（原版 `baseFor(path)` 路由，gemini-credits.ts:31-33）。
 //!
-//! project 动态探测（loadCodeAssist）与配额（retrieveUserQuotaSummary，请求体
-//! 空对象）见 `detect_project`/`quota_summary`；thoughtSignature 跨轮回填、
-//! sessionId 升代自愈在后续切片接入（T4.2c）。
+//! project 动态探测（loadCodeAssist，两级取值）与配额（retrieveUserQuotaSummary，
+//! 请求体必须带 project）见 `detect_project`/`quota_summary`；thoughtSignature
+//! 跨轮回填（只取 functionCall part 自身字段）、sessionId 升代自愈、
+//! sigstore 2000 条上限淘汰一半 + 原子写均见对应结构。
+//!
+//! TODO(真流式/空闲超时)：`send()` 目前整体缓冲响应体后一次性解析（伪流式）。
+//! 参考实现按字节流增量消费并对每次 read 施加 120s 空闲超时
+//! （gemini-messages.ts:578-761，GEMINI_IDLE_TIMEOUT_MS）——上游生成大
+//! functionCall 参数期间可能长时间不 flush 任何字节，裸读会无限期挂起
+//! （表现为「发消息后永远转圈」）。接入 `bytes_stream` 后补：帧级增量下发 +
+//! tokio::time::timeout 空闲看门狗（首 token 与 chunk 间同一预算）。
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
@@ -23,16 +40,26 @@ use crate::registry::{ModelInfo, ProviderCatalog};
 use crate::route::Route;
 use crate::sse::SseParser;
 
+/// 主端点（client.go 的 EndpointDaily）。
 pub const DEFAULT_BASE: &str = "https://daily-cloudcode-pa.googleapis.com";
+/// 沙箱端点（client.go 的 EndpointSandbox；LCA/配额固定走它，推理兜底）。
+pub const SANDBOX_BASE: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 const GENERATE_PATH: &str = "/v1internal:streamGenerateContent?alt=sse";
 const LOAD_PATH: &str = "/v1internal:loadCodeAssist";
 const QUOTA_PATH: &str = "/v1internal:retrieveUserQuotaSummary";
 const CLIENT_UA: &str = "antigravity/4.3.0 (cmdc-pak)";
 const DEFAULT_EFFORT_SUFFIX: &str = "-medium";
+/// 上游唯一准入主名（gemini.ts:412/460-470；其余必 404 或被静默回落）。
+pub const UPSTREAM_MODEL: &str = "gemini-3.8-flash";
 /// 信封 userAgent 字段是短串 'antigravity'（gemini-messages.ts:340），
 /// 与 HTTP UA（含版本）不同。
 const ENVELOPE_UA: &str = "antigravity";
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 64_000;
+/// 请求体上限（发送前真实检查，gemini.ts:704 / gemini-adapter.ts:613-623）：
+/// 超限时上游要么回措辞不稳定的 400 要么直接断连，都不如本地判定可查。
+/// 归类走 ContextWindowExceeded（触发压缩重试）而不是 BadRequest（死路）。
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// 思考档位 → thinkingBudget（gemini.ts:414-418；tiered=-1 不发 budget）。
 fn thinking_budget(tier: &str) -> i64 {
     match tier {
@@ -42,18 +69,29 @@ fn thinking_budget(tier: &str) -> i64 {
         _ => 4_000,
     }
 }
-/// Gemini schema 白名单（gemini.ts GEMINI_SCHEMA_KEYS 21 键）；白名单外键
-/// 上游硬 400。递归清洗：properties/items/anyOf 深入；type 数组收敛补
-/// nullable；enum 含非字符串值整删（Gemini 只接受字符串枚举）。
+
+/// 剥掉已知档位后缀得目录裸名（gemini.ts:513-518）。
+fn canonical_model(model: &str) -> &str {
+    for tier in ["-low", "-medium", "-high", "-tiered"] {
+        if let Some(stripped) = model.strip_suffix(tier) {
+            return stripped;
+        }
+    }
+    model
+}
+
+/// Gemini schema 白名单（gemini.ts GEMINI_SCHEMA_KEYS，19 键）；白名单外键
+/// 上游硬 400。递归清洗：properties/items/anyOf 深入；type 数组收敛（滤
+/// 'null' 取首个非空 + 出现过 'null' 才补 nullable）；enum 含非字符串值整删
+/// （Gemini 只接受字符串枚举）。
 fn sanitize_schema(v: &Value) -> Value {
     match v {
         Value::Object(m) => {
-            const KEYS: [&str; 21] = [
+            const KEYS: [&str; 19] = [
                 "type", "format", "description", "nullable", "enum", "items", "minItems",
                 "maxItems", "properties", "required", "minProperties", "maxProperties",
                 "minLength", "maxLength", "pattern", "anyOf", "propertyOrdering", "minimum",
-                "maximum", // 21 键中留 2 位给未来发展
-                "__never__", "__never2__",
+                "maximum",
             ];
             let mut out = Map::new();
             for (k, val) in m {
@@ -91,11 +129,18 @@ fn sanitize_schema(v: &Value) -> Value {
                     }
                     "type" => {
                         if let Some(arr) = val.as_array() {
-                            // 数组形态收敛成首个 + nullable
-                            let first = arr.first().cloned().unwrap_or(Value::Null);
-                            out.insert("type".into(), first);
-                            out.insert("nullable".into(), Value::Bool(true));
-                        } else {
+                            // 数组形态（如 ["string","null"]）：滤 'null' 取首个，
+                            // 出现过 'null' 才补 nullable（gemini.ts:656-668）
+                            let types: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+                            let non_null: Vec<&str> =
+                                types.iter().copied().filter(|s| *s != "null").collect();
+                            if let Some(first) = non_null.first() {
+                                out.insert("type".into(), Value::String((*first).to_string()));
+                            }
+                            if non_null.len() != types.len() {
+                                out.insert("nullable".into(), Value::Bool(true));
+                            }
+                        } else if val.is_string() {
                             out.insert("type".into(), val.clone());
                         }
                     }
@@ -118,16 +163,18 @@ fn sanitize_schema(v: &Value) -> Value {
         other => other.clone(),
     }
 }
-/// tool_choice → toolConfig（gemini-messages.ts:360-392）。
-fn build_tool_config(tool_choice: Option<&Value>) -> Option<Value> {
-    let tc = tool_choice?;
-    let mode = match tc {
-        Value::String(s) => match s.as_str() {
+
+/// tool_choice → toolConfig（gemini-messages.ts:360-392）。有工具就**恒发**
+/// （DSH 无 toolChoice 字段时参考实现也发默认 AUTO），mode 归一：
+/// none→NONE；any/required/{type:any|tool}→ANY；其余 AUTO。
+fn build_tool_config(tool_choice: Option<&Value>) -> Value {
+    let mode = match tool_choice {
+        Some(Value::String(s)) => match s.as_str() {
             "none" => "NONE",
             "any" | "required" => "ANY",
             _ => "AUTO",
         },
-        Value::Object(o) => match o.get("type").and_then(Value::as_str).unwrap_or("") {
+        Some(Value::Object(o)) => match o.get("type").and_then(Value::as_str).unwrap_or("") {
             "none" => "NONE",
             "any" | "tool" | "function" => "ANY",
             _ => "AUTO",
@@ -137,11 +184,12 @@ fn build_tool_config(tool_choice: Option<&Value>) -> Option<Value> {
     let mut fc = Map::new();
     fc.insert("mode".into(), Value::String(mode.into()));
     if mode == "ANY" {
-        let name = tc
-            .as_object()
+        let name = tool_choice
+            .and_then(Value::as_object)
             .and_then(|o| {
                 o.get("function")
                     .and_then(|f| f.get("name"))
+                    .or_else(|| o.get("tool").and_then(|t| t.get("name")))
                     .or_else(|| o.get("name"))
                     .and_then(Value::as_str)
                     .filter(|n| !n.is_empty())
@@ -151,11 +199,14 @@ fn build_tool_config(tool_choice: Option<&Value>) -> Option<Value> {
             fc.insert("allowedFunctionNames".into(), serde_json::json!([n]));
         }
     }
-    Some(serde_json::json!({ "functionCallingConfig": Value::Object(fc) }))
+    serde_json::json!({ "functionCallingConfig": Value::Object(fc) })
 }
 
 pub struct GeminiProvider {
     base: String,
+    /// 备用（sandbox）端点：None = 单端点模式（测试桩兼容），生产注入
+    /// SANDBOX_BASE。推理轮换序 [base, sandbox]；LCA/配额固定 sandbox。
+    sandbox_base: Option<String>,
     /// 探测到空时的兜底 project（`aicode-consumers`）。
     fallback_project: String,
     /// 会话派生 + 升代状态。
@@ -167,16 +218,39 @@ pub struct GeminiProvider {
     sigs: std::sync::Arc<SigStore>,
 }
 
-/// thoughtSignature 跨轮状态（§4.14 要点②）。
-/// 精确键 =「工具名 + 按键名升序的紧凑 JSON」（§3.6 `canonicalArgs`，两侧必须
-/// 同一序列化）；精确 miss 时按工具名最近一次兜底。生产落盘
-/// `~/.tokenmaster/gemini-sigs.json` 独立文件（共享文档整体替换会抹掉未知
-/// 字段的教训——签名状态单独成文件，不进账号存储）。
+/// 缓存条数上限（gemini-sigstore.ts:49）：签名串平均 300~800 字节，
+/// 2000 条约 1MB 量级，足够覆盖一个工作日的会话。
+pub const SIG_MAX_ENTRIES: usize = 2_000;
+
+/// thoughtSignature 跨轮状态（gemini-sigstore.ts 权威口径）。
+///
+/// - 精确键 = sha256("tool:"+名 + NUL + canonicalArgs 前 512 字符).hex[..16]，
+///   精确 miss 时按工具名最近一次兜底（参数漂移在长任务里是必然事件，
+///   兜底缺失会让每轮都走去签重试、丢掉整条思考链）；
+/// - **只记录 functionCall part 自身的签名**（思考分片上的签名回传时被上游
+///   忽略，存了纯属噪音还会挤爆缓存，gemini-messages.ts:683-686）；
+/// - 写入 trim、空签名丢弃；上限 2000 条淘汰最旧一半；原子写（tmp+rename）。
+///
+/// 生产落盘 `~/.tokenmaster/gemini-sigs.json` 独立文件（共享文档整体替换会
+/// 抹掉未知字段的教训——签名状态单独成文件，不进账号存储）。
 #[derive(Default)]
 pub struct SigStore {
-    exact: std::sync::Mutex<std::collections::HashMap<String, String>>,
-    by_name: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// 插入序维护（同键覆盖并挪到末尾，等价参考实现的 Map 插入序语义）。
+    entries: std::sync::Mutex<Vec<SigEntry>>,
     path: Option<std::path::PathBuf>,
+    /// 脏标记：写入置位，flush 落盘后复位（参考实现的 dirty 字段语义——
+    /// 每请求结束冲刷一次，而不是每条记录全量重写）。
+    dirty: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone)]
+struct SigEntry {
+    key: String,
+    sig: String,
+    /// 写入时刻（秒）——淘汰按它取最旧一半（秒级精度，同秒内按插入序）。
+    at: u64,
+    /// 工具名（持久化：键是哈希不可逆，不存名字就没法重建按名兜底索引）。
+    name: String,
 }
 
 impl SigStore {
@@ -184,34 +258,42 @@ impl SigStore {
         Self::default()
     }
 
-    /// 读已有文件恢复（缺失/损坏降级为空表，推理不因此中断）。
+    /// 当前条目数（诊断/测试用）。
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.lock().unwrap().is_empty()
+    }
+
+    /// 读已有文件恢复（缺失/损坏降级为空表，推理不因此中断——纯缓存）。
+    /// 落盘形状 `{"<key16>":{"sig","at","name"}}`（gemini-sigstore.ts:203-215）。
     pub fn load_or_create(path: std::path::PathBuf) -> Self {
         let store = Self { path: Some(path.clone()), ..Self::default() };
         let Ok(txt) = std::fs::read_to_string(&path) else { return store };
         let Ok(v) = serde_json::from_str::<Value>(&txt) else { return store };
-        if let Some(m) = v.get("exact").and_then(Value::as_object) {
-            for (k, sig) in m {
-                if let Some(s) = sig.as_str() {
-                    store.exact.lock().unwrap().insert(k.clone(), s.to_string());
-                }
+        let Some(m) = v.as_object() else { return store };
+        let mut entries = Vec::new();
+        for (k, e) in m {
+            let Some(sig) = e.get("sig").and_then(Value::as_str) else { continue };
+            if sig.is_empty() {
+                continue;
             }
+            let at = e.get("at").and_then(Value::as_u64).unwrap_or(0);
+            let name = e.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+            entries.push(SigEntry { key: k.clone(), sig: sig.to_string(), at, name });
         }
-        if let Some(m) = v.get("by_name").and_then(Value::as_object) {
-            for (k, sig) in m {
-                if let Some(s) = sig.as_str() {
-                    store.by_name.lock().unwrap().insert(k.clone(), s.to_string());
-                }
-            }
-        }
+        *store.entries.lock().unwrap() = entries;
         store
     }
 
     fn key(name: &str, canonical_args: &str) -> String {
-        // gemini-sigstore.ts:57/80-94：sha256("tool:"+名+" "+canonical前512).hex[..16]
+        // gemini-sigstore.ts:57/80-94：sha256("tool:"+名+NUL+canonical前512).hex[..16]
         use sha2::{Digest, Sha256};
         let body: String = canonical_args.chars().take(512).collect();
         let mut h = Sha256::new();
-        h.update(format!("tool:{name} {body}"));
+        h.update(format!("tool:{name}\0{body}"));
         format!("{:x}", h.finalize())[..16].to_string()
     }
 
@@ -221,32 +303,80 @@ impl SigStore {
         self.record_with_canonical(name, &canonical, sig);
     }
 
-    fn record_with_canonical(&self, name: &str, canonical_args: &str, sig: &str) {
+    pub(crate) fn record_with_canonical(&self, name: &str, canonical_args: &str, sig: &str) {
         let sig = sig.trim();
-        if sig.is_empty() {
-            return; // 空签名丢弃（gemini-sigstore.ts:97-99）
+        // 空签名/空工具名丢弃（gemini-sigstore.ts:97-99/169-171）：上游偶尔下发
+        // 空串占位，存进去会让回填侧以为「有签名」而发一个空字段。
+        if sig.is_empty() || name.is_empty() {
+            return;
         }
-        self.exact
-            .lock()
-            .unwrap()
-            .insert(Self::key(name, canonical_args), sig.to_string());
-        self.by_name.lock().unwrap().insert(name.to_string(), sig.to_string());
-        if let Some(p) = &self.path {
-            let snapshot = serde_json::json!({
-                "exact": &*self.exact.lock().unwrap(),
-                "by_name": &*self.by_name.lock().unwrap(),
-            });
-            let _ = std::fs::write(p, snapshot.to_string());
+        let key = Self::key(name, canonical_args);
+        let at = now_ts_secs();
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|e| e.key != key); // 覆盖并挪到末尾（Map 插入序语义）
+        entries.push(SigEntry { key, sig: sig.to_string(), at, name: name.to_string() });
+        if entries.len() > SIG_MAX_ENTRIES {
+            Self::evict(&mut entries);
         }
+        drop(entries);
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// 精确键优先，miss 时按工具名最近一次兜底；从未见过返回 None。
+    /// 淘汰最旧的一半（按 at 稳定排序，gemini-sigstore.ts:185-192：不做精确
+    /// LRU，只「少留一点空间」；同秒内按插入序，与参考实现的稳定排序等价）。
+    fn evict(entries: &mut Vec<SigEntry>) {
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by_key(|&i| entries[i].at);
+        let half = order.len() / 2;
+        let evict_keys: std::collections::HashSet<&usize> = order[..half].iter().collect();
+        let mut idx = 0;
+        entries.retain(|_| {
+            let keep = !evict_keys.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+
+    /// 精确键优先，miss 时按工具名最近一次兜底；从未见过返回 None
+    /// （「最近」按插入序，不用秒级时间戳——同秒两次写入无法区分，实测踩过）。
     pub fn lookup(&self, name: &str, args: &Value) -> Option<String> {
         let canonical = alphabetize(args).to_string();
         let key = Self::key(name, &canonical);
-        self.exact.lock().unwrap().get(&key).cloned().or_else(|| {
-            self.by_name.lock().unwrap().get(name).cloned()
-        })
+        let entries = self.entries.lock().unwrap();
+        if let Some(e) = entries.iter().rev().find(|e| e.key == key && !e.sig.is_empty()) {
+            return Some(e.sig.clone());
+        }
+        entries
+            .iter()
+            .rev()
+            .find(|e| e.name == name && !e.sig.is_empty())
+            .map(|e| e.sig.clone())
+    }
+
+    /// 冲刷落盘：请求结束调用（参考实现 stream 的 finally 冲刷）。无脏改动
+    /// 或纯内存模式为 no-op。
+    pub fn flush(&self) {
+        if !self.dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let Some(p) = &self.path else { return };
+        let entries = self.entries.lock().unwrap();
+        let mut obj = Map::new();
+        for e in entries.iter() {
+            obj.insert(
+                e.key.clone(),
+                serde_json::json!({ "sig": e.sig, "at": e.at, "name": e.name }),
+            );
+        }
+        drop(entries);
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut tmp = p.clone().into_os_string();
+        tmp.push(".tmp");
+        if std::fs::write(&tmp, Value::Object(obj).to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, p);
+        }
     }
 }
 
@@ -259,18 +389,53 @@ struct SessionState {
     gen: u32,
 }
 
-
-
-/// 上下文超限专属判据（§4.14 要点⑤：句式无 context 字样，
-/// harness 认不出，不能靠通用 400 处理）。
+/// 上下文超限专属判据（gemini-adapter.ts:154-155 GEMINI_TOKEN_COUNT_OVERFLOW：
+/// "token count" 后短距 "exceed(s)" + "the maximum"，句式无 context 字样，
+/// 通用判据认不出）。大小写不敏感；exceed 搜索窗限定在 "token count" 后
+/// 80 字符内，避免长正文里的无关共现误判。
 pub fn is_context_exceeded(text: &str) -> bool {
-    text.contains("The input token count") && text.contains("exceeds")
+    let lower = text.to_lowercase();
+    let Some(i) = lower.find("token count") else { return false };
+    let window_end = (i + 80).min(lower.len());
+    let Some(j) = lower[i..window_end].find("exceed") else { return false };
+    lower[i + j..].contains("the maximum")
+}
+
+/// 服务端按 sessionId 累计超 1M 的专属句式（gemini-adapter.ts:123-125，
+/// 判据逐字抄自 Antigravity-Manager 的 [FIX session-1M]）。必须**先于**
+/// is_quota_text 判定：换端点/换号解决不了服务端会话累计。
+pub fn is_session_overflow(text: &str) -> bool {
+    text.to_lowercase().contains("exceeds the maximum number of tokens")
+}
+
+/// 签名被上游拒绝（gemini-adapter.ts:84-88）。必须**宽**：上游文案不统一
+/// （thought_signature / Invalid signature / signature is required…），漏判的
+/// 后果是用户看到一次莫名其妙的 400；误判只是多发一次不带签名的请求
+/// （那条路径本来就要试）。
+pub fn is_signature_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("signature") || (lower.contains("thought") && lower.contains("invalid"))
+}
+
+/// 400 正文指向配额/权限/工程号类问题（gemini-adapter.ts:91-94，决定先换端点）。
+fn is_switchable_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["quota", "permission", "unsupported", "project"].iter().any(|w| lower.contains(w))
+}
+
+/// 400 正文明确是配额耗尽（gemini-adapter.ts:97-101，归类限流交编排层换号）。
+pub fn is_quota_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    ["quota", "resource_exhausted", "resource exhausted", "rate limit", "exceeded"]
+        .iter()
+        .any(|w| lower.contains(w))
 }
 
 impl GeminiProvider {
     pub fn new(base: String, fallback_project: String) -> Self {
         Self {
             base,
+            sandbox_base: None,
             fallback_project,
             session: std::sync::Mutex::new(SessionState::default()),
             client: reqwest::Client::new(),
@@ -279,17 +444,26 @@ impl GeminiProvider {
         }
     }
 
+    /// 注入备用（sandbox）端点：生产装配用；不注入则单端点模式
+    /// （LCA/配额回落主端点，推理不轮换），便于单桩测试。
+    pub fn with_sandbox_base(mut self, sandbox: String) -> Self {
+        self.sandbox_base = Some(sandbox);
+        self
+    }
+
     /// sessionId 确定性派生（gemini.ts:186-203）：FNV-1a 64（有符号十进制），
-    /// 输入 `project lane firstUserText`（generation>0 再追加 " "+gen）。
+    /// 输入 `project\0lane\0firstUserText`（generation>0 再追加 "\0"+gen；
+    /// 分隔符是 NUL 不是空格，generation==0 不拼代数段——必须与升代前同值，
+    /// 否则升级这个功能本身就会让所有进行中的对话换一次 id 丢 prompt cache）。
     /// lane 是业务路径字面量：推理 `'infer'` / 冒烟 `'smoke'`（与端点无关）。
     pub fn derive_session_id(project: &str, first_user: &str, lane: &str) -> String {
         Self::derive_session_id_gen(project, first_user, lane, 0)
     }
 
     pub fn derive_session_id_gen(project: &str, first_user: &str, lane: &str, generation: u32) -> String {
-        let mut input = format!("{project} {lane} {first_user}");
+        let mut input = format!("{project}\0{lane}\0{first_user}");
         if generation > 0 {
-            input.push_str(&format!(" {generation}"));
+            input.push_str(&format!("\0{generation}"));
         }
         let mut hash: u64 = 0xcbf29ce484222325;
         for b in input.bytes() {
@@ -299,12 +473,13 @@ impl GeminiProvider {
         (hash as i64).to_string()
     }
 
-    /// 首条 user 文本口径：构造后 contents[0] 的第一个非空 text part
-    /// （gemini-messages.ts:178-186）。
+    /// 首条 user 文本口径（gemini-messages.ts:178-186：按构造后的 contents 取
+    /// 首个 user 角色条目、只看其中第一个非空 text part——开头的 assistant/
+    /// tool 之外角色不参与；后续文本也不进哈希）。
     fn first_user_text(req: &ChatRequest) -> String {
         req.messages
             .iter()
-            .find(|m| m.role != "system")
+            .find(|m| m.role == "user" || m.role == "tool")
             .map(|m| match &m.content {
                 Value::Array(parts) => parts
                     .iter()
@@ -340,6 +515,7 @@ impl GeminiProvider {
 
     pub fn production() -> Self {
         let mut p = Self::new(DEFAULT_BASE.into(), "aicode-consumers".into());
+        p.sandbox_base = Some(SANDBOX_BASE.into());
         if let Ok(st) = crate::store::Store::open_default() {
             p.sigs = std::sync::Arc::new(SigStore::load_or_create(
                 st.root().join("gemini-sigs.json"),
@@ -378,28 +554,62 @@ impl GeminiProvider {
         }
     }
 
-    async fn load_code_assist(&self, cred: &Credential) -> Result<Value, ProviderError> {
-        let resp = self
-            .client
-            .post(format!("{}{}", self.base, LOAD_PATH))
-            .headers(self.identity_headers(cred))
-            // 逐字常量（gemini.ts:97；多字段可能被识别为非官方客户端）
-            .json(&serde_json::json!({ "metadata": { "ideType": "ANTIGRAVITY" } }))
-            .send()
-            .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
-        if status != 200 {
-            return Err(map_status_error(status, String::from_utf8_lossy(&bytes).to_string()));
+    /// LCA 探测端点序（sandbox 优先、daily 兜底，gemini-project.ts:100-106/134：
+    /// 原版 baseFor 把 loadCodeAssist 固定路由 sandbox）。
+    fn probe_endpoints(&self) -> Vec<String> {
+        match &self.sandbox_base {
+            Some(s) => vec![s.clone(), self.base.clone()],
+            None => vec![self.base.clone()],
         }
-        serde_json::from_slice(&bytes)
-            .map_err(|e| ProviderError::Upstream(format!("loadCodeAssist 响应非 JSON: {e}")))
+    }
+
+    /// LCA/配额固定端点（gemini-credits.ts:31-33；单端点模式回落主端点）。
+    fn meta_base(&self) -> &str {
+        self.sandbox_base.as_deref().unwrap_or(&self.base)
+    }
+
+    /// loadCodeAssist：逐端点探测，全部失败才报错（gemini-project.ts:142-172）。
+    /// 逐字常量请求体（gemini.ts:97；多字段可能被识别为非官方客户端）。
+    async fn load_code_assist(&self, cred: &Credential) -> Result<Value, ProviderError> {
+        let mut last_err = String::from("loadCodeAssist 探测失败");
+        for ep in self.probe_endpoints() {
+            let attempt = self
+                .client
+                .post(format!("{ep}{LOAD_PATH}"))
+                .headers(self.identity_headers(cred))
+                .json(&serde_json::json!({ "metadata": { "ideType": "ANTIGRAVITY" } }))
+                .send()
+                .await;
+            let resp = match attempt {
+                Ok(r) => r,
+                Err(e) => {
+                    last_err = e.to_string();
+                    continue;
+                }
+            };
+            let status = resp.status().as_u16();
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    last_err = e.to_string();
+                    continue;
+                }
+            };
+            if status != 200 {
+                last_err = format!("loadCodeAssist HTTP {status}");
+                continue;
+            }
+            match serde_json::from_slice(&bytes) {
+                Ok(v) => return Ok(v),
+                Err(e) => last_err = format!("loadCodeAssist 响应非 JSON: {e}"),
+            }
+        }
+        Err(ProviderError::Upstream(last_err))
     }
 
     /// project 动态探测（每次真探测并更新缓存；GUI/入池可手动刷新）。
     /// 失败 ≠ 探测到空：HTTP/解析失败返回 Err，调用方不得发推理；
-    /// 200 但无 `cloudaicompanionProject` 时用兜底值。
+    /// 200 但无 `cloudaicompanionProject` 时用兜底值（免费档常态）。
     pub async fn detect_project(&self, cred: &Credential) -> Result<String, ProviderError> {
         let v = self.load_code_assist(cred).await?;
         // 两级取值：顶层 → currentTier 嵌套（gemini-project.ts:72-83）
@@ -426,14 +636,14 @@ impl GeminiProvider {
     }
 
     /// 配额摘要（5h/周双窗口百分比，单位 '%' 不参与积分归一）。
-    /// 请求体固定空对象 `{}` 且不带 project；响应 schema 参考实现未在手册给出
-    /// 完整字段表，原样透传 JSON 供 GUI 接线时以真实响应校准。
+    /// **固定走 sandbox 端点**（原版 baseFor 路由）；请求体必须带 `project`
+    /// （字段名是 project 不是 cloudaicompanionProject，空对象对部分账号回
+    /// 403 SUBSCRIPTION_REQUIRED——gemini-credits.ts:12-29）。响应 schema 参考
+    /// 实现未在手册给出完整字段表，原样透传 JSON 供 GUI 接线时以真实响应校准。
     pub async fn quota_summary(&self, cred: &Credential, project: &str) -> Result<Value, ProviderError> {
-        // 请求体必须带 project（字段名是 project 不是 cloudaicompanionProject，
-        // 空对象对部分账号回 403 SUBSCRIPTION_REQUIRED——gemini-credits.ts:12-29）
         let resp = self
             .client
-            .post(format!("{}{}", self.base, QUOTA_PATH))
+            .post(format!("{}{}", self.meta_base(), QUOTA_PATH))
             .headers(self.identity_headers(cred))
             .json(&serde_json::json!({ "project": project }))
             .send()
@@ -467,7 +677,16 @@ impl GeminiProvider {
         map
     }
 
-    fn build_envelope(&self, project: &str, session_id: &str, route: &Route, req: &ChatRequest) -> Result<Value, ProviderError> {
+    /// 构造双层信封（gemini-messages.ts translateGeminiRequest）。
+    /// `with_sigs=false` 供去签重试（参考实现重进循环时跳过签名查表）。
+    fn build_envelope(
+        &self,
+        project: &str,
+        session_id: &str,
+        route: &Route,
+        req: &ChatRequest,
+        with_sigs: bool,
+    ) -> Result<Value, ProviderError> {
         let name_map = Self::tool_name_map(req);
         let mut contents: Vec<Value> = Vec::new();
         let mut system_parts: Vec<String> = Vec::new();
@@ -482,7 +701,7 @@ impl GeminiProvider {
             let role = if m.role == "assistant" { "model" } else { "user" };
             let mut parts: Vec<Value> = Vec::new();
             let t = m.text();
-            // tool 消息的结果只走 functionResponse.response.result，不另发 text part
+            // tool 消息的结果只走 functionResponse.response.content，不另发 text part
             if m.role != "tool" && !t.is_empty() {
                 parts.push(serde_json::json!({ "text": t }));
             }
@@ -498,39 +717,49 @@ impl GeminiProvider {
                                 .pointer("/function/arguments")
                                 .and_then(Value::as_str)
                                 .unwrap_or("{}");
-                            // args 解析失败明确报错，不伪造 {} 合法外观
-                            let args: Value = serde_json::from_str(args_raw)
-                                .map_err(|e| ProviderError::BadRequest(format!("tool_call arguments 非 JSON: {e}")))?;
+                            // 解析失败/非对象退化为 {}（gemini-messages.ts:405-416：
+                            // 不编造参数，也不因畸形历史打死整轮请求）
+                            let args: Value = match serde_json::from_str(args_raw) {
+                                Ok(v @ Value::Object(_)) => v,
+                                _ => Value::Object(Map::new()),
+                            };
                             let mut fc = Map::new();
                             fc.insert("args".into(), args.clone());
                             fc.insert("name".into(), Value::String(name.to_string()));
                             // 跨轮签名回填：精确键优先，同工具名最近一次兜底
-                            if let Some(sig) = self.sigs.lookup(name, &args) {
-                                fc.insert("thoughtSignature".into(), Value::String(sig));
+                            if with_sigs {
+                                if let Some(sig) = self.sigs.lookup(name, &args) {
+                                    fc.insert("thoughtSignature".into(), Value::String(sig));
+                                }
                             }
                             parts.push(serde_json::json!({ "functionCall": Value::Object(fc) }));
                         }
                     }
                 }
                 "tool" => {
-                    let id = m.tool_call_id.as_deref().ok_or_else(|| {
-                        ProviderError::BadRequest("role:tool 消息缺 tool_call_id".into())
-                    })?;
-                    let name = name_map.get(id).ok_or_else(|| {
-                        ProviderError::BadRequest(format!("tool_call_id {id} 无对应 tool_use"))
-                    })?;
-                    // response 用 content 键（gemini-messages.ts:246-250；
-                    // isError→error:true 的 OpenAI 入口暂无对应标志）
-                    parts.push(serde_json::json!({
-                        "functionResponse": { "name": name, "response": { "content": t } }
-                    }));
+                    // name 必须来自 tool_use 映射：解析不到整块丢弃（上游按 name
+                    // 配对，空 name 会 400；丢了顶多少一轮工具上下文，不打死
+                    // 整轮——gemini-messages.ts:240-245）
+                    if let Some(id) = m.tool_call_id.as_deref() {
+                        if let Some(name) = name_map.get(id) {
+                            parts.push(serde_json::json!({
+                                "functionResponse": { "name": name, "response": { "content": t } }
+                            }));
+                        }
+                    }
                 }
                 _ => {}
             }
+            // 空消息整条跳过（gemini-messages.ts:278-279；发空 parts 上游 400）
             if parts.is_empty() {
-                parts.push(serde_json::json!({ "text": t }));
+                continue;
             }
             contents.push(serde_json::json!({ "parts": parts, "role": role }));
+        }
+        if contents.is_empty() {
+            return Err(ProviderError::BadRequest(
+                "gemini: messages 里没有可用内容（全部为空/孤儿 tool 结果）".into(),
+            ));
         }
         let mut request = Map::new();
         request.insert("contents".into(), Value::Array(contents));
@@ -540,6 +769,7 @@ impl GeminiProvider {
         let wire = Self::wire_model(&route.model);
         let tier = wire.rsplit('-').next().unwrap_or("medium");
         let mut thinking = Map::new();
+        // includeThoughts 恒 true（「关闭思考」是假关：关掉照样思考照样计费）
         thinking.insert("includeThoughts".into(), Value::Bool(true));
         let budget = thinking_budget(tier);
         if budget >= 0 {
@@ -579,17 +809,17 @@ impl GeminiProvider {
                     "tools".into(),
                     serde_json::json!([{ "functionDeclarations": decls }]),
                 );
-                // tool_choice → toolConfig（仅在有工具时发）
-                if let Some(tc) = build_tool_config(req.raw.get("tool_choice")) {
-                    request.insert("toolConfig".into(), tc);
-                }
+                // 有工具就恒发 toolConfig（gemini-messages.ts:332-333/360-375：
+                // 参考实现无 toolChoice 时也发默认 AUTO，不做条件省略）
+                request.insert("toolConfig".into(), build_tool_config(req.raw.get("tool_choice")));
             }
         }
         let mut root = Map::new();
-        root.insert("model".into(), Value::String(Self::wire_model(&route.model)));
+        root.insert("model".into(), Value::String(wire));
         root.insert("project".into(), Value::String(project.to_string()));
         root.insert("request".into(), Value::Object(request));
-        // requestId 形态 agent/{ms}/{8hex}（gemini.ts:400-402）
+        // requestId 形态 agent/{ms}/{8hex}（gemini.ts:400-402），每请求随机——
+        // 重试（去签/升代/换端点）也重新生成，与参考「每轮重构信封」一致
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -602,71 +832,111 @@ impl GeminiProvider {
         Ok(alphabetize(&Value::Object(root)))
     }
 
+    /// 单次推理 POST（流式刻意不带 Accept，抓包一致；信封已字母序序列化）。
+    async fn post_generate(
+        &self,
+        base: &str,
+        wire: &str,
+        cred: &Credential,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let mut h = self.identity_headers(cred);
+        h.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        self.client
+            .post(format!("{base}{GENERATE_PATH}"))
+            .headers(h)
+            .body(wire.to_string())
+            .send()
+            .await
+            .map_err(|e| ProviderError::Upstream(e.to_string()))
+    }
+
     /// 发送推理请求：返回 (HTTP 状态, 响应体)。
-    /// 400 处置升级式：先判上下文超限（升代重试一次，再超限归
-    /// `ContextWindowExceeded`），否则带签被拒去签重试一次。
+    ///
+    /// 失败处置升级式（gemini-adapter.ts:660-758 的单号内部分）：
+    /// 1. 签名被拒（宽判据）→ 去签重试一次（同端点同号）；
+    /// 2. 400 服务端会话累计超 1M → 升代换新 sessionId 重试一次（先于端点/
+    ///    配额判定——换端点换号都救不了服务端累计）；再超限归
+    ///    ContextWindowExceeded（本地历史太大时升代没用，交客户端压缩）；
+    /// 3. 403/404/400(quota|permission|unsupported|project) 或 429 首次 →
+    ///    先换端点（廉价兜底，一次）；
+    /// 4. 换端点救不了 → 分类上抛：429→RateLimited(60s)（编排层冷却+换号）、
+    ///    401→Credential（编排层续期/换号）、403/404→Upstream（编排层换号）。
     async fn send(
         &self,
         cred: &Credential,
         route: &Route,
         req: &ChatRequest,
     ) -> Result<(u16, Vec<u8>), ProviderError> {
+        // 模型准入门（gemini.ts:537-546，纯本地零网络）：名字是上游准入键，
+        // 放行的后果是上游静默回落 3.8，用户拿到错误模型的答案且无任何征兆
+        if canonical_model(&route.model) != UPSTREAM_MODEL {
+            return Err(ProviderError::BadRequest(format!(
+                "gemini: 模型 {} 不在本 provider 目录中（仅支持 {UPSTREAM_MODEL}）",
+                route.model
+            )));
+        }
         // 探测失败不发推理（失败 ≠ 探测到空）
         let project = self.resolve_project(cred).await?;
-        let url = format!("{}{}", self.base, GENERATE_PATH);
-        let headers = self.identity_headers(cred);
-        let post = |body: Value| {
-            let mut req = self.client.post(&url);
-            req = req.headers(headers.clone()).json(&body);
-            async move { req.send().await }
-        };
-        let sid = self.current_session_id(&project, req);
-        let body = self.build_envelope(&project, &sid, route, req)?;
-        let resp = post(body.clone()).await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
-        if status == 400 {
+        let endpoints = self.inference_endpoints();
+        let mut endpoint_idx = 0usize;
+        let mut endpoint_switched = false;
+        let mut dropped_signatures = false;
+        let mut session_bumped = false;
+        let mut sid = self.current_session_id(&project, req);
+        loop {
+            let body = self.build_envelope(&project, &sid, route, req, !dropped_signatures)?;
+            // 请求体上限发送前检查（gemini-adapter.ts:613-623）
+            let wire = body.to_string();
+            if wire.len() > MAX_REQUEST_BODY_BYTES {
+                return Err(ProviderError::ContextWindowExceeded(format!(
+                    "gemini: 请求体 {} 字节超过上限 {MAX_REQUEST_BODY_BYTES} 字节",
+                    wire.len()
+                )));
+            }
+            let resp = self
+                .post_generate(&endpoints[endpoint_idx], &wire, cred)
+                .await?;
+            let status = resp.status().as_u16();
+            let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
+            if status == 200 {
+                return Ok((status, bytes));
+            }
             let text = String::from_utf8_lossy(&bytes).to_string();
-            if is_context_exceeded(&text) {
-                // 升代自愈：服务端按 sessionId 累计，唯一出路换新 id；一次请求最多一代
-                let sid2 = self.bump_generation(&project, req);
-                let body2 = self.build_envelope(&project, &sid2, route, req)?;
-                let resp2 = post(body2).await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
-                let status2 = resp2.status().as_u16();
-                let bytes2 = resp2.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
-                if status2 == 400 && is_context_exceeded(&String::from_utf8_lossy(&bytes2)) {
-                    return Err(ProviderError::ContextWindowExceeded(text));
-                }
-                return Ok((status2, bytes2));
+            // 1) 签名被拒 → 去签重试一次（仅一次，同端点同号）
+            if is_signature_error(&text) && !dropped_signatures && wire.contains("thoughtSignature") {
+                dropped_signatures = true;
+                continue;
             }
-            // 带签被拒 → 去签重试一次（§4.14 要点②；仅一次，不再循环）
-            let stripped = strip_thought_signatures(&body);
-            if stripped != body {
-                let resp2 = post(stripped).await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
-                let status2 = resp2.status().as_u16();
-                let bytes2 = resp2.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
-                return Ok((status2, bytes2));
+            // 2) 服务端会话累计超 1M → 升代（一次请求最多一代；再超限走 4) 的
+            //    ContextWindowExceeded 归类）
+            if status == 400 && is_session_overflow(&text) && !session_bumped {
+                session_bumped = true;
+                sid = self.bump_generation(&project, req);
+                continue;
             }
+            // 3) 先换端点（一次；单端点模式无备选直接走分类）
+            let endpoint_first =
+                status == 403 || status == 404 || (status == 400 && is_switchable_text(&text));
+            if (endpoint_first || status == 429) && !endpoint_switched && endpoints.len() > 1 {
+                endpoint_switched = true;
+                endpoint_idx = 1;
+                continue;
+            }
+            // 4) 分类上抛（401 续期、429 冷却换号由编排层承接）
+            return Err(map_status_error(status, text));
         }
-        Ok((status, bytes))
     }
-}
 
-/// 递归移除全部 `thoughtSignature` 键（去签重试用）。
-fn strip_thought_signatures(v: &Value) -> Value {
-    match v {
-        Value::Object(m) => {
-            let mut out = Map::new();
-            for (k, val) in m {
-                if k == "thoughtSignature" {
-                    continue;
-                }
-                out.insert(k.clone(), strip_thought_signatures(val));
-            }
-            Value::Object(out)
+    /// 推理端点序（gemini.ts:75 GEMINI_ENDPOINTS：daily 先，sandbox 兜底；
+    /// 单端点模式只有主端点）。
+    fn inference_endpoints(&self) -> Vec<String> {
+        match &self.sandbox_base {
+            Some(s) => vec![self.base.clone(), s.clone()],
+            None => vec![self.base.clone()],
         }
-        Value::Array(a) => Value::Array(a.iter().map(strip_thought_signatures).collect()),
-        other => other.clone(),
     }
 }
 
@@ -687,12 +957,28 @@ pub fn alphabetize(v: &Value) -> Value {
     }
 }
 
-/// HTTP 状态 → ProviderError（公开供单测）。
+/// HTTP 状态 + 正文 → ProviderError（公开供单测）。
+///
+/// 归类顺序有讲究（gemini-adapter.ts:774-794）：上下文超限**最先**判——
+/// is_quota_text 的关键词表含 "exceeded"，超限报文先落 quota 会被误归限流，
+/// 丢掉客户端压缩重试的机会（归错码的代价不对称：多判一次溢出只是多一次
+/// 无效压缩尝试，漏判则长会话每轮报废）。
 pub fn map_status_error(status: u16, msg: String) -> ProviderError {
+    if status == 400 && is_context_exceeded(&msg) {
+        return ProviderError::ContextWindowExceeded(format!("400 context exceeded: {msg}"));
+    }
+    if status == 400 && is_quota_text(&msg) {
+        // 400 配额文案（RESOURCE_EXHAUSTED 等）语义等同限流：编排层冷却换号
+        return ProviderError::RateLimited { retry_after_secs: Some(60), msg: format!("400 quota: {msg}") };
+    }
     match status {
         401 => ProviderError::Credential(format!("401 token rejected: {msg}")),
         429 => ProviderError::RateLimited { retry_after_secs: Some(60), msg: format!("429 quota: {msg}") },
-        404 => ProviderError::BadRequest(format!("404 model not admitted (needs effort suffix): {msg}")),
+        // 403/404 归 Upstream（参考 SERVER 分类，gemini-adapter.ts:788-791）：
+        // Cloud Code 上这两个码多是「入口/模型注册表不认」，归凭据错误会把
+        // 用户引向「去重新登录」这个无效动作
+        403 | 404 => ProviderError::Upstream(format!("http {status}: {msg}")),
+        400 => ProviderError::BadRequest(format!("400 rejected: {msg}")),
         code => ProviderError::Upstream(format!("http {code}: {msg}")),
     }
 }
@@ -700,32 +986,48 @@ pub fn map_status_error(status: u16, msg: String) -> ProviderError {
 /// 一帧 SSE data 的聚合结果。
 struct FrameData {
     text: String,
+    /// `thought:true` 分片的文本（思考链，stream 走 Reasoning chunk、非流式
+    /// 丢弃——OutMessage 无 reasoning 字段，与 commandcode 同口径）
+    reasoning: String,
     /// functionCall 调用 (name, args JSON 串)
     calls: Vec<(String, String)>,
-    /// 签名事件 (工具名, canonical args, signature)——与同消息后续 functionCall 配对
+    /// 签名事件 (工具名, canonical args, signature)——只来自 functionCall
+    /// part 自身的 thoughtSignature 字段
     sig_events: Vec<(String, String, String)>,
     usage: Option<Usage>,
+    finish_reason: Option<String>,
 }
 
+/// 解析一帧 SSE data（gemini-messages.ts processFrame）。
+///
+/// 帧可能是 `{"response":{…}}` 信封**或**裸 `Response`——先试信封再试裸
+/// （:634-637）；`candidates` 缺失/为空是纯 usage 收尾帧，只带用量。
+/// `thought:true` 的文本 part 是思考链（includeThoughts 恒 true，必有），
+/// 与正文分开聚合（:683-694）。
 fn parse_frame(v: &Value) -> FrameData {
-    let parts = v.pointer("/candidates/0/content/parts").and_then(Value::as_array);
-    let text: String = parts
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                .collect::<String>()
-        })
-        .unwrap_or_default();
-    // 签名配对：thinking part 的 thoughtSignature 搬到同消息后续 functionCall 上
-    let mut pending_sigs: std::collections::VecDeque<String> = parts
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|p| p.get("thoughtSignature").and_then(Value::as_str).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let inner = match v.get("response") {
+        Some(Value::Object(_)) => v.get("response").unwrap_or(v),
+        _ => v,
+    };
+    let candidate = inner
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|c| c.first());
+    let parts = candidate
+        .and_then(|c| c.pointer("/content/parts"))
+        .and_then(Value::as_array);
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    if let Some(parts) = parts {
+        for p in parts {
+            let Some(t) = p.get("text").and_then(Value::as_str) else { continue };
+            if p.get("thought").and_then(Value::as_bool) == Some(true) {
+                reasoning.push_str(t);
+            } else {
+                text.push_str(t);
+            }
+        }
+    }
     let mut calls = Vec::new();
     let mut sig_events = Vec::new();
     if let Some(parts) = parts {
@@ -733,13 +1035,24 @@ fn parse_frame(v: &Value) -> FrameData {
             let Some(fc) = p.get("functionCall").and_then(Value::as_object) else { continue };
             let name = fc.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
             let args = fc.get("args").cloned().unwrap_or(Value::Object(Map::new()));
-            if let Some(sig) = pending_sigs.pop_front() {
-                sig_events.push((name.clone(), alphabetize(&args).to_string(), sig));
+            // 只取 functionCall part 自身的签名（gemini-messages.ts:651-657）：
+            // 思考分片上的签名回传时被上游忽略，存了纯属噪音（sigstore 头注）
+            if let Some(sig) = p
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                sig_events.push((name.clone(), alphabetize(&args).to_string(), sig.to_string()));
             }
             calls.push((name, args.to_string()));
         }
     }
-    let usage = v.get("usageMetadata").map(|u| {
+    let finish_reason = candidate
+        .and_then(|c| c.get("finishReason"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let usage = inner.get("usageMetadata").map(|u| {
         let prompt = u.get("promptTokenCount").and_then(Value::as_u64).unwrap_or(0);
         let cached = u.get("cachedContentTokenCount").and_then(Value::as_u64).unwrap_or(0);
         let completion = u.get("candidatesTokenCount").and_then(Value::as_u64).unwrap_or(0);
@@ -751,7 +1064,36 @@ fn parse_frame(v: &Value) -> FrameData {
             total_tokens: total,
         }
     });
-    FrameData { text, calls, sig_events, usage }
+    FrameData { text, reasoning, calls, sig_events, usage, finish_reason }
+}
+
+/// 多帧 usage 聚合器：保留「totalTokenCount 最大」的那一份（上游多帧重复
+/// 播报 usage，早期帧数字偏小——末帧覆盖会少计，gemini-messages.ts:705-712）。
+#[derive(Default)]
+struct UsageAgg {
+    usage: Usage,
+    best_total: i64,
+}
+
+impl UsageAgg {
+    fn note(&mut self, u: Usage) {
+        if (u.total_tokens as i64) >= self.best_total {
+            self.best_total = u.total_tokens as i64;
+            self.usage = u;
+        }
+    }
+}
+
+/// 上游 finishReason → OpenAI finish_reason（mapGeminiFinish :489-497 的
+/// OpenAI 词汇版：未知/缺失一律 stop，不编造成错误；有工具调用优先）。
+fn map_finish(saw_tool_call: bool, finish_reason: Option<&str>) -> &'static str {
+    if saw_tool_call {
+        return "tool_calls";
+    }
+    if finish_reason == Some("MAX_TOKENS") {
+        return "length";
+    }
+    "stop"
 }
 
 /// 聚合的 functionCall 列表 → OpenAI tool_calls 形态。
@@ -784,7 +1126,7 @@ impl Provider for GeminiProvider {
         ProviderCatalog {
             id: "gemini".into(),
             // 上游准入表只认 gemini-3.8-flash（gemini.ts:460-554，其余必 404）
-            models: vec![ModelInfo { id: "gemini-3.8-flash".into() }],
+            models: vec![ModelInfo { id: UPSTREAM_MODEL.into() }],
         }
     }
 
@@ -798,7 +1140,8 @@ impl Provider for GeminiProvider {
         parser.finalize();
         let mut text = String::new();
         let mut calls: Vec<(String, String)> = Vec::new();
-        let mut usage = Usage::default();
+        let mut usage = UsageAgg::default();
+        let mut finish_reason: Option<String> = None;
         while let Some(data) = parser.next_data() {
             let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
             let fd = parse_frame(&v);
@@ -807,14 +1150,20 @@ impl Provider for GeminiProvider {
             for (name, canonical, sig) in fd.sig_events {
                 self.sigs.record_with_canonical(&name, &canonical, &sig);
             }
+            if let Some(fr) = fd.finish_reason {
+                finish_reason = Some(fr);
+            }
             if let Some(u2) = fd.usage {
-                usage = u2;
+                usage.note(u2);
             }
         }
-        let mut out = ChatCompletion::new(route.composite(), text, usage);
+        // 请求结束冲刷签名缓存（参考实现 stream finally；纯缓存，失败吞掉）
+        self.sigs.flush();
+        let mut out = ChatCompletion::new(route.composite(), text, usage.usage);
+        out.choices[0].finish_reason =
+            Some(map_finish(!calls.is_empty(), finish_reason.as_deref()).into());
         if !calls.is_empty() {
             out.choices[0].message.tool_calls = Some(openai_tool_calls(&calls));
-            out.choices[0].finish_reason = Some("tool_calls".into());
         }
         Ok(out)
     }
@@ -830,11 +1179,15 @@ impl Provider for GeminiProvider {
         let mut queue: std::collections::VecDeque<Result<StreamChunk, ProviderError>> =
             std::collections::VecDeque::new();
         queue.push_back(Ok(StreamChunk::Role));
-        let mut usage = Usage::default();
+        let mut usage = UsageAgg::default();
         let mut saw_tool_call = false;
+        let mut finish_reason: Option<String> = None;
         while let Some(data) = parser.next_data() {
             let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
             let fd = parse_frame(&v);
+            if !fd.reasoning.is_empty() {
+                queue.push_back(Ok(StreamChunk::Reasoning(fd.reasoning)));
+            }
             if !fd.text.is_empty() {
                 queue.push_back(Ok(StreamChunk::Content(fd.text)));
             }
@@ -850,27 +1203,28 @@ impl Provider for GeminiProvider {
             for (name, canonical, sig) in fd.sig_events {
                 self.sigs.record_with_canonical(&name, &canonical, &sig);
             }
+            if let Some(fr) = fd.finish_reason {
+                finish_reason = Some(fr);
+            }
             if let Some(u2) = fd.usage {
-                usage = u2;
+                usage.note(u2);
             }
         }
+        // 请求结束冲刷签名缓存（参考实现 stream finally；纯缓存，失败吞掉）
+        self.sigs.flush();
         // 上游一次性返回帧流；帧尽即完成
-        let reason = if saw_tool_call { "tool_calls" } else { "stop" };
-        queue.push_back(Ok(StreamChunk::Finish { reason: reason.into(), usage }));
+        let reason = map_finish(saw_tool_call, finish_reason.as_deref());
+        queue.push_back(Ok(StreamChunk::Finish { reason: reason.into(), usage: usage.usage }));
         Ok(Box::pin(futures::stream::iter(queue)))
     }
 }
 
-/// Gemini OAuth（§4.14）：授权 `accounts.google.com/o/oauth2/v2/auth` +
+/// Gemini OAuth（gemini-oauth.ts）：授权 `accounts.google.com/o/oauth2/v2/auth` +
 /// token `oauth2.googleapis.com/token`；**refresh_token 会轮换，刷新后必须
 /// 立即回写**（响应未带新 rt 时保留旧值）。
 ///
 /// 凭据 secret 形态：JSON `{access_token, refresh_token, expires_at}`；
 /// 推理 Authorization 取其中 access_token（裸串回退兼容）。
-///
-/// ⚠️ 生产默认值待确认（手册未载明）：client 的公开 client_id 具体值（参考
-/// 实现经 env `CMDC_PAK_GOOGLE_CLIENT_ID` 可覆盖）与六项 scope 逐字清单
-/// （`cloud-platform`+`cclog`+`experimentsandconfigs` 等）。
 #[derive(Clone)]
 pub struct GeminiOAuth {
     auth_url: String,
@@ -953,7 +1307,7 @@ impl GeminiOAuth {
     }
 
     /// 授权 URL（response_type=code + access_type=offline 换 refresh_token；
-    /// prompt=consent 保证离线授权下发）。
+    /// prompt=consent 保证离线授权下发；include_granted_scopes=true 与参考一致）。
     pub fn login_url(&self, redirect_uri: &str, state: &str) -> String {
         format!(
             "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&access_type=offline&include_granted_scopes=true&prompt=consent",
@@ -1007,7 +1361,7 @@ impl GeminiOAuth {
     }
 
     /// 本地回环回调登录：随机端口起 listener，返回 (授权 URL, 凭据接收端)。
-    /// 浏览器完成授权后 Google 重定向到 `http://127.0.0.1:{port}?code=…&state=…`，
+    /// 浏览器完成授权后 Google 重定向到 `http://localhost:{port}?code=…&state=…`，
     /// 校验 state（防 CSRF）→ 交换 token → oneshot 回传 Credential。
     pub async fn start_login(
         &self,
@@ -1049,9 +1403,18 @@ impl GeminiOAuth {
                 },
             ),
         );
+        let app_v6 = app.clone();
         tokio::spawn(async move {
             axum::serve(listener, app).await.expect("callback serve");
         });
+        // IPv6 兜底监听（gemini-oauth.ts:424-463）：浏览器常把 localhost 解析成
+        // ::1，只听 v4 会「页面打不开/授权完没反应」；[::1] 绑定失败可容忍
+        //（机器没开 IPv6 时 v4 仍可用），端口同 v4。
+        if let Ok(v6) = tokio::net::TcpListener::bind(("[::1]", port)).await {
+            tokio::spawn(async move {
+                axum::serve(v6, app_v6).await.expect("callback serve v6");
+            });
+        }
         (url, rx)
     }
 

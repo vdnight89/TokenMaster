@@ -67,12 +67,12 @@ fn cred() -> Credential {
 }
 
 fn route() -> Route {
-    Route { provider: "gemini".into(), model: "gemini-3-pro".into() }
+    Route { provider: "gemini".into(), model: "gemini-3.8-flash".into() }
 }
 
 fn tool_req() -> ChatRequest {
     serde_json::from_value(json!({
-        "model": "gemini/gemini-3-pro",
+        "model": "gemini/gemini-3.8-flash",
         "tools": [{
             "type": "function",
             "function": {
@@ -162,4 +162,132 @@ async fn stream_function_call_becomes_tool_call_delta() {
     let (reason, usage) = finish.expect("must finish");
     assert_eq!(reason, "tool_calls");
     assert_eq!(usage.prompt_tokens, 9);
+}
+
+/// 有 tools 就**恒发** toolConfig（gemini-messages.ts:332-333/360-375：参考实现
+/// 无 toolChoice 字段时也发默认 AUTO，不做条件省略）；命名强制时 ANY +
+/// allowedFunctionNames。
+#[tokio::test]
+async fn tool_config_always_present_when_tools_declared() {
+    let (base, cap) = spawn().await;
+    pv(base).complete(&cred(), &route(), &tool_req()).await.unwrap();
+    let raw = cap.lock().unwrap().body.clone().unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        v["request"]["toolConfig"]["functionCallingConfig"]["mode"],
+        json!("AUTO"),
+        "无 tool_choice 也须发默认 AUTO 的 toolConfig"
+    );
+}
+
+#[tokio::test]
+async fn named_tool_choice_maps_to_any_with_allowed_function_names() {
+    let (base, cap) = spawn().await;
+    let mut req = tool_req();
+    req.raw.insert(
+        "tool_choice".into(),
+        json!({ "type": "function", "function": { "name": "get_weather" } }),
+    );
+    pv(base).complete(&cred(), &route(), &req).await.unwrap();
+    let raw = cap.lock().unwrap().body.clone().unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    let fc = &v["request"]["toolConfig"]["functionCallingConfig"];
+    assert_eq!(fc["mode"], json!("ANY"));
+    assert_eq!(fc["allowedFunctionNames"], json!(["get_weather"]));
+}
+
+/// 孤儿 tool 结果（tool_call_id 查无对应 tool_use）整块丢弃，不打死整轮
+/// （gemini-messages.ts:240-245：上游按 name 配对，空 name 会 400）。
+#[tokio::test]
+async fn orphan_tool_result_dropped_not_fatal() {
+    let (base, cap) = spawn().await;
+    let req: ChatRequest = serde_json::from_value(json!({
+        "model": "gemini/gemini-3.8-flash",
+        "tools": [{
+            "type": "function",
+            "function": { "name": "get_weather", "parameters": { "type": "object", "properties": {} } }
+        }],
+        "messages": [
+            { "role": "user", "content": "天气怎么样" },
+            { "role": "tool", "tool_call_id": "call_unknown", "content": "孤儿结果" }
+        ]
+    }))
+    .unwrap();
+    let out = pv(base).complete(&cred(), &route(), &req).await.unwrap();
+    assert!(out.choices[0].message.content.contains("查一下"));
+    let raw = cap.lock().unwrap().body.clone().unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    let contents = v["request"]["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 1, "孤儿 tool 消息整条跳过：{raw}");
+    assert_eq!(contents[0]["role"], json!("user"));
+}
+
+/// schema 清洗（gemini.ts:615-681）：type 数组滤 'null' 收敛 + nullable；
+/// 含非字符串枚举整删；白名单外键（additionalProperties/$schema）整键删除。
+#[tokio::test]
+async fn schema_type_array_and_enum_sanitized() {
+    let (base, cap) = spawn().await;
+    let req: ChatRequest = serde_json::from_value(json!({
+        "model": "gemini/gemini-3.8-flash",
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "mixed_tool",
+                "parameters": {
+                    "type": "object",
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "additionalProperties": false,
+                    "properties": {
+                        "maybe": { "type": ["string", "null"], "description": "可空" },
+                        "num": { "type": ["null", "integer"] },
+                        "kind": { "enum": [1, "a", "b"] }
+                    },
+                    "required": ["maybe"]
+                }
+            }
+        }],
+        "messages": [{ "role": "user", "content": "跑工具" }]
+    }))
+    .unwrap();
+    pv(base).complete(&cred(), &route(), &req).await.unwrap();
+    let raw = cap.lock().unwrap().body.clone().unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    let params = &v["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
+    assert!(params.get("$schema").is_none(), "白名单外键必须整键删除");
+    assert!(params.get("additionalProperties").is_none(), "白名单外键必须整键删除");
+    let props = &params["properties"];
+    // ["string","null"] → type: string + nullable: true（滤 null 取首个非空）
+    assert_eq!(props["maybe"]["type"], json!("string"));
+    assert_eq!(props["maybe"]["nullable"], json!(true));
+    // ["null","integer"] → null 在首位也滤掉，type 取 integer
+    assert_eq!(props["num"]["type"], json!("integer"));
+    assert_eq!(props["num"]["nullable"], json!(true));
+    // enum 含非字符串值（1）→ 整删
+    assert!(props["kind"].get("enum").is_none(), "非字符串枚举必须整删");
+    assert_eq!(params["required"], json!(["maybe"]));
+}
+
+/// assistant tool_call 的 args 解析失败退化为 {}（gemini-messages.ts:405-416：
+/// 不编造参数外观，也不因畸形历史打死整轮）。
+#[tokio::test]
+async fn malformed_tool_call_args_degrade_to_empty_object() {
+    let (base, cap) = spawn().await;
+    let req: ChatRequest = serde_json::from_value(json!({
+        "model": "gemini/gemini-3.8-flash",
+        "messages": [
+            { "role": "user", "content": "天气怎么样" },
+            { "role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": { "name": "get_weather", "arguments": "{not-json" }
+            }]},
+            { "role": "tool", "tool_call_id": "call_1", "content": "晴" }
+        ]
+    }))
+    .unwrap();
+    let out = pv(base).complete(&cred(), &route(), &req).await.unwrap();
+    assert!(out.choices[0].message.content.contains("查一下"), "畸形历史不得打死整轮");
+    let raw = cap.lock().unwrap().body.clone().unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    let fc = &v["request"]["contents"][1]["parts"][0]["functionCall"];
+    assert_eq!(fc["args"], json!({}), "解析失败退化为空对象");
 }

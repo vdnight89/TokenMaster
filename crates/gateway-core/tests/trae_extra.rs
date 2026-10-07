@@ -26,7 +26,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use gateway_core::provider::{Provider, ProviderError};
 use gateway_core::providers::trae::{
-    derive_checkin_device_id, TraeProvider,
+    derive_checkin_device_id, TraeProvider, DEFAULT_OAUTH_BASE,
 };
 use gateway_core::Credential;
 use serde_json::{json, Value};
@@ -178,6 +178,15 @@ async fn exchange_html_401_maps_to_credential_error() {
     assert!(matches!(err, ProviderError::Credential(_)), "{err:?}");
 }
 
+#[test]
+fn production_uses_separate_oauth_host() {
+    // ExchangeToken 在 OAuth 域 api.trae.com.cn（trae-product.ts:186），
+    // 与 UG 域 api.trae.cn 不同源——混用会打错服务器。
+    assert_eq!(DEFAULT_OAUTH_BASE, "https://api.trae.com.cn");
+    let p = TraeProvider::production();
+    let _ = p; // 构造不炸即三域齐备
+}
+
 // ───────── 空响应重试 ─────────
 
 #[tokio::test]
@@ -261,6 +270,13 @@ async fn checkin_claim_supplements_status_and_derives_stable_device() {
     assert_eq!(h.get("package-type").unwrap(), "stable_cn");
     assert!(h.get("x-market-user-id").is_some());
     assert!(h.get("vscode-sessionid").is_some());
+    // 每请求独立的 trace/request id（trae.ts:289-290）
+    let trace = h.get("x-tt-trace-id").unwrap().to_str().unwrap();
+    assert!(trace.starts_with("00-") && trace.ends_with("-01") && trace.len() == 22, "trace 形态 00-<16hex>-01：{trace}");
+    assert!(h.get("x-request-id").is_some(), "X-Request-Id 逐字对齐参考");
+    assert_eq!(h.get("sec-fetch-dest").unwrap(), "empty");
+    assert_eq!(h.get("sec-fetch-mode").unwrap(), "no-cors");
+    assert_eq!(h.get("sec-fetch-site").unwrap(), "none");
     // uid 派生确定性
     assert_eq!(derive_checkin_device_id("u-9527"), did);
     assert_ne!(derive_checkin_device_id("u-other"), did, "每账号互异");
@@ -279,4 +295,39 @@ async fn checkin_9074_cooldown_without_device_rotation() {
     assert_eq!(claims.len(), 1, "不换设备重试");
     let d1 = claims[0].1.as_ref().unwrap().get("x-device-id").unwrap().to_str().unwrap();
     assert_eq!(d1, derive_checkin_device_id("u-9527"));
+}
+
+#[tokio::test]
+async fn checkin_1005_maps_to_plan_limit_cooldown() {
+    // 200 + code=1005 → PlanLimit 43200s（classifyTraeCheckinError，
+    // trae-credits.ts:78-79）
+    let (base, cap) = spawn().await;
+    cap.lock().unwrap().claim_body = json!({ "code": 1005, "message": "plan" });
+    match pv(base).checkin_claim(&cred()).await.unwrap_err() {
+        ProviderError::RateLimited { retry_after_secs, .. } => assert_eq!(retry_after_secs, Some(43_200)),
+        other => panic!("1005 → 12h 冷却：{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn catalog_prefers_fetched_models_over_hardcoded_fallback() {
+    // fetch_models 成功后 catalog() 返回远端目录；未拉取时回退硬编码单模型
+    let (base, cap) = spawn().await;
+    let provider = pv(base);
+    let fallback = provider.catalog();
+    assert_eq!(fallback.models.len(), 1);
+    assert_eq!(fallback.models[0].id, "glm-5.2");
+    drop(fallback);
+
+    cap.lock().unwrap().models_body = json!({ "function_configs": [
+        { "function": "solo_work_lite", "config_info_list": [
+            { "config_name": "glm-5.2", "usage": "chat_completion", "config_switch": true, "is_invisible_to_user": false },
+            { "config_name": "kimi-k3", "usage": "chat_completion", "config_switch": true, "is_invisible_to_user": false }
+        ]}
+    ]});
+    provider.fetch_models(&cred()).await.unwrap();
+    let catalog = provider.catalog();
+    let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+    assert!(ids.contains(&"glm-5.2") && ids.contains(&"kimi-k3"), "catalog 用缓存：{ids:?}");
+    assert_eq!(catalog.id, "trae");
 }

@@ -57,7 +57,7 @@ async fn stub_generate(State(cap): State<Arc<(Meta, Mutex<Cap>)>>, body: axum::e
         let body = if matches!(behavior, GenBehavior::Unrelated400) {
             "bad request for other reasons"
         } else {
-            "The input token count (1048576) exceeds the maximum allowed number of tokens"
+            "The input token count (1048576) exceeds the maximum number of tokens allowed (1048576)."
         };
         return (StatusCode::BAD_REQUEST, body).into_response();
     }
@@ -85,7 +85,7 @@ fn pv(base: String) -> GeminiProvider {
 
 fn req(first_user: &str) -> ChatRequest {
     serde_json::from_value(json!({
-        "model": "gemini/gemini-3-pro",
+        "model": "gemini/gemini-3.8-flash",
         "messages": [{ "role": "user", "content": first_user }]
     }))
     .unwrap()
@@ -96,7 +96,7 @@ fn cred() -> Credential {
 }
 
 fn route() -> Route {
-    Route { provider: "gemini".into(), model: "gemini-3-pro".into() }
+    Route { provider: "gemini".into(), model: "gemini-3.8-flash".into() }
 }
 
 #[tokio::test]

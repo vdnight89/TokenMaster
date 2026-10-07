@@ -180,9 +180,9 @@ async fn identity_headers_use_access_token_from_json_secret() {
     let out = p
         .complete(
             &Credential { account_id: "g1".into(), secret },
-            &gateway_core::route::Route { provider: "gemini".into(), model: "gemini-3-pro".into() },
+            &gateway_core::route::Route { provider: "gemini".into(), model: "gemini-3.8-flash".into() },
             &serde_json::from_value(json!({
-                "model": "gemini/gemini-3-pro",
+                "model": "gemini/gemini-3.8-flash",
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
             .unwrap(),

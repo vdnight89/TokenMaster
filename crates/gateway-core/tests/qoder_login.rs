@@ -1,4 +1,4 @@
-//! T4.20a qoder 设备码登录/续期/Cosy 头修正（缝 2：stub 上游）。
+//! T4.20a qoder 设备码登录/续期/userinfo 昵称/Cosy 头（缝 2：stub 上游）。
 //! 行为来源（参考源码行号）：
 //! - 设备码登录没有"从 API 拿 code"这一步：nonce/PKCE verifier/
 //!   machine_id 全本地生成；challenge = base64url(sha256(verifier))
@@ -12,6 +12,9 @@
 //! - 成功解析：token 取 `token`|`device_token`|`access_token` 三键；
 //!   **user_id → uid（加密推理必需）**；凭据 `security_oauth_token` 与
 //!   `access_token` 双写同值 + machine_id 随凭据持久化。
+//! - **登录成功后补查 GET /api/v1/userinfo 取昵称**（qoder.ts:344-394）：
+//!   设备码响应通常没有 user_name（实测 4 账号全缺），userinfo 的 `name`
+//!   是唯一可靠来源；失败不致命（退回 user_name，可能为空）。
 //! - refresh：POST `/api/v1/deviceToken/refresh` body {refresh_token,
 //!   machine_id}；终态=401/403 或 200 无 token；回写保留 machine_id/uid。
 //! - Cosy 头修正：ClientType 实测值 '10'（qoder-product.ts:454-455）。
@@ -34,6 +37,9 @@ struct Cap {
     refresh_body: Mutex<Option<String>>,
     refresh_headers: Mutex<Option<axum::http::HeaderMap>>,
     usage_headers: Mutex<Option<axum::http::HeaderMap>>,
+    userinfo_headers: Mutex<Option<axum::http::HeaderMap>>,
+    /// true = userinfo 返回 500（验证补查失败不致命）
+    userinfo_fail: Mutex<bool>,
     /// 前两次 poll 404，第三次成功
     polls_before_ok: Mutex<usize>,
 }
@@ -65,7 +71,18 @@ async fn stub_refresh(State(cap): State<Arc<Cap>>, headers: axum::http::HeaderMa
 
 async fn stub_usage(State(cap): State<Arc<Cap>>, headers: axum::http::HeaderMap) -> Response {
     *cap.usage_headers.lock().unwrap() = Some(headers);
-    Json(json!({ "data": { "userQuota": [{ "remaining": 5 }], "addOnQuota": [] } })).into_response()
+    Json(json!({ "displayMode": "qoder", "qoderUsage": {
+        "userQuota": { "remaining": 5 }, "addOnQuota": {}
+    }})).into_response()
+}
+
+async fn stub_userinfo(State(cap): State<Arc<Cap>>, headers: axum::http::HeaderMap) -> Response {
+    *cap.userinfo_headers.lock().unwrap() = Some(headers);
+    if *cap.userinfo_fail.lock().unwrap() {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+    }
+    // 带空白以同时验证 trim（qoder.ts:387-390）
+    Json(json!({ "name": " 真实昵称 " })).into_response()
 }
 
 async fn spawn() -> (String, Arc<Cap>) {
@@ -75,6 +92,7 @@ async fn spawn() -> (String, Arc<Cap>) {
         .route("/api/v1/deviceToken/poll", get(stub_poll))
         .route("/api/v1/deviceToken/refresh", post(stub_refresh))
         .route("/sash/api/v2/me/usage", get(stub_usage))
+        .route("/api/v1/userinfo", get(stub_userinfo))
         .with_state(cap.clone());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -117,6 +135,36 @@ async fn device_login_polls_404_then_builds_credential() {
     let first_query = cap.poll_hits.lock().unwrap()[0].clone();
     assert!(first_query.contains("nonce=") && first_query.contains("verifier=") && first_query.contains("challenge_method=S256"), "{first_query}");
     let _ = build_qoder_poll_url(&sess);
+}
+
+#[tokio::test]
+async fn login_fetches_nickname_from_userinfo() {
+    // qoder.ts:344-363：设备码响应通常没有 user_name（实测 4 账号全缺），
+    // userinfo 的 name 是昵称唯一可靠来源——登录成功后必须补查
+    let (openapi, cap) = spawn().await;
+    let oa = oauth(openapi);
+    let sess = oa.create_device_session();
+    let cred = oa.poll_until_token(&sess, std::time::Duration::from_millis(10)).await.unwrap();
+    let v: Value = serde_json::from_str(&cred.secret).unwrap();
+    assert_eq!(v["nickname"], json!("真实昵称"), "userinfo name 覆盖 user_name 且 trim");
+    let h = cap.userinfo_headers.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        h.get("authorization").unwrap().to_str().unwrap(),
+        "Bearer at-login",
+        "userinfo 用 Bearer 头（security_oauth_token 优先）"
+    );
+}
+
+#[tokio::test]
+async fn userinfo_failure_does_not_fail_login() {
+    // 昵称只是展示信息：userinfo 失败退回设备码响应的 user_name（qoder.ts:365-367）
+    let (openapi, cap) = spawn().await;
+    *cap.userinfo_fail.lock().unwrap() = true;
+    let oa = oauth(openapi);
+    let sess = oa.create_device_session();
+    let cred = oa.poll_until_token(&sess, std::time::Duration::from_millis(10)).await.unwrap();
+    let v: Value = serde_json::from_str(&cred.secret).unwrap();
+    assert_eq!(v["nickname"], json!("qoder-user"), "失败退回 user_name");
 }
 
 #[tokio::test]

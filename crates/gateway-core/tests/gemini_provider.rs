@@ -164,6 +164,182 @@ async fn unauthorized_maps_to_credential_error() {
     assert!(matches!(err429, ProviderError::RateLimited { .. }));
 }
 
+/// 错误分类矩阵（gemini-adapter.ts:774-794 归类顺序：超限最先，防被 quota
+/// 关键词表里的 "exceeded" 误吃）。401→换号续期；429/400 配额文案→冷却换号；
+/// 403/404→Upstream 换号（不误导重新登录）；未知 400→BadRequest 终态。
+#[tokio::test]
+async fn error_classification_matrix() {
+    use gateway_core::providers::gemini::map_status_error as m;
+    assert!(matches!(
+        m(400, "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).".into()),
+        ProviderError::ContextWindowExceeded(_)
+    ));
+    assert!(matches!(
+        m(400, "RESOURCE_EXHAUSTED: quota exceeded for project".into()),
+        ProviderError::RateLimited { .. }
+    ));
+    assert!(matches!(m(403, "PERMISSION_DENIED".into()), ProviderError::Upstream(_)));
+    assert!(matches!(m(404, "Requested entity was not found.".into()), ProviderError::Upstream(_)));
+    assert!(matches!(m(400, "Unknown name \"foo\"".into()), ProviderError::BadRequest(_)));
+    assert!(matches!(m(500, "boom".into()), ProviderError::Upstream(_)));
+}
+
+/// SSE 帧可能是 `{"response":{…}}` 信封或裸 Response（gemini-messages.ts:634-637，
+/// 先试信封再试裸）；usage 取「totalTokenCount 最大」的那一份（多帧重复播报，
+/// 早期帧偏小——末帧覆盖会少计，:705-712）。
+#[tokio::test]
+async fn envelope_frames_parse_and_usage_takes_max_total() {
+    let cap = Arc::new(Mutex::new(Stub::default()));
+    let app = Router::new()
+        .route(
+            "/v1internal:streamGenerateContent",
+            post(|| async {
+                let sse = concat!(
+                    // 信封形态内容帧（thought 分片进 Reasoning，不进正文）
+                    "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"思\",\"thought\":true},{\"text\":\"你\"}],\"role\":\"model\"}}]}}\n\n",
+                    // 裸形态内容帧
+                    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"好\"}],\"role\":\"model\"}}]}\n\n",
+                    // 早期小 usage 帧（信封形态、无 candidates）
+                    "data: {\"response\":{\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":1,\"totalTokenCount\":6}}}\n\n",
+                    // 终帧大 usage：必须以它为准（input 扣缓存）
+                    "data: {\"candidates\":[],\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":7,\"cachedContentTokenCount\":3,\"totalTokenCount\":19}}\n\n",
+                );
+                ([("content-type", "text/event-stream")], sse)
+            }),
+        )
+        .route("/v1internal:loadCodeAssist", post(|| async { Json(json!({})) }))
+        .with_state(cap.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("stub serve") });
+
+    let out = pv(format!("http://{addr}")).complete(&cred(), &route(), &req()).await.unwrap();
+    // thought:true 分片不进正文
+    assert_eq!(out.choices[0].message.content, "你好");
+    // usage = 最大 totalTokenCount 帧：input 12-3=9、completion 7、total 19
+    assert_eq!(out.usage.prompt_tokens, 9);
+    assert_eq!(out.usage.completion_tokens, 7);
+    assert_eq!(out.usage.total_tokens, 19);
+
+    // 流式：thought 分片走 Reasoning chunk
+    let mut s = pv(format!("http://{addr}")).stream(&cred(), &route(), &req()).await.unwrap();
+    let mut reasoning = String::new();
+    let mut text = String::new();
+    while let Some(item) = s.next().await {
+        match item.expect("chunk") {
+            StreamChunk::Reasoning(t) => reasoning.push_str(&t),
+            StreamChunk::Content(t) => text.push_str(&t),
+            _ => {}
+        }
+    }
+    assert_eq!(reasoning, "思");
+    assert_eq!(text, "你好");
+}
+
+/// 429 先换端点（廉价兜底，gemini-adapter.ts:707-711）：daily 恒 429，
+/// sandbox 正常 → 单号内换端点一次即成功。
+#[tokio::test]
+async fn rate_limit_switches_endpoint_once_before_failing() {
+    let daily_hits = Arc::new(Mutex::new(0usize));
+    let h = daily_hits.clone();
+    let daily = Router::new()
+        .route(
+            "/v1internal:streamGenerateContent",
+            post(move |s: axum::extract::State<Arc<Mutex<usize>>>| async move {
+                *s.0.lock().unwrap() += 1;
+                (StatusCode::TOO_MANY_REQUESTS, "resource exhausted")
+            }),
+        )
+        .route("/v1internal:loadCodeAssist", post(|| async { Json(json!({})) }))
+        .with_state(h);
+    let l1 = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let daily_addr = l1.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l1, daily).await.expect("daily serve") });
+
+    let sb_hits = Arc::new(Mutex::new(0usize));
+    let h2 = sb_hits.clone();
+    let sandbox = Router::new()
+        .route(
+            "/v1internal:streamGenerateContent",
+            post(move |s: axum::extract::State<Arc<Mutex<usize>>>| async move {
+                *s.0.lock().unwrap() += 1;
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"好\"}],\"role\":\"model\"}}]}\n\n",
+                )
+            }),
+        )
+        .with_state(h2);
+    let l2 = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let sb_addr = l2.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l2, sandbox).await.expect("sb serve") });
+
+    let p = GeminiProvider::new(format!("http://{daily_addr}"), "aicode-consumers".into())
+        .with_sandbox_base(format!("http://{sb_addr}"));
+    let out = p.complete(&cred(), &route(), &req()).await.unwrap();
+    assert!(out.choices[0].message.content.contains("好"));
+    assert_eq!(*daily_hits.lock().unwrap(), 1, "daily 429 一次后换端点");
+    assert_eq!(*sb_hits.lock().unwrap(), 1, "sandbox 承接第二次");
+}
+
+/// 429 两端点都限流 → RateLimited(60s) 上抛，交编排层冷却换号（不再原地重试）。
+#[tokio::test]
+async fn persistent_rate_limit_maps_to_rate_limited() {
+    let stub = Router::new()
+        .route(
+            "/v1internal:streamGenerateContent",
+            post(|| async { (StatusCode::TOO_MANY_REQUESTS, "quota exceeded") }),
+        )
+        .route("/v1internal:loadCodeAssist", post(|| async { Json(json!({})) }));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, stub).await.expect("stub serve") });
+    let url = format!("http://{addr}");
+    let p = GeminiProvider::new(url.clone(), "aicode-consumers".into())
+        .with_sandbox_base(url); // 双端点同桩：两次都 429
+    let err = p.complete(&cred(), &route(), &req()).await.unwrap_err();
+    match err {
+        ProviderError::RateLimited { retry_after_secs, .. } => {
+            assert_eq!(retry_after_secs, Some(60), "429 冷却缺省 60s（计划 §3.1）");
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
+}
+
+/// 未知模型本地拒绝（gemini.ts:537-546）：上游对未知名静默回落 3.8，放行的
+/// 后果是用户拿到错误模型的答案且无任何征兆——宁可本地 404。
+#[tokio::test]
+async fn unknown_model_rejected_locally_without_network() {
+    let (base, cap) = spawn().await;
+    let mut r = route();
+    r.model = "gemini-9.9-fake".into();
+    let err = pv(base).complete(&cred(), &r, &req()).await.unwrap_err();
+    assert!(matches!(err, ProviderError::BadRequest(_)), "{err:?}");
+    let s = cap.lock().unwrap();
+    assert!(s.raw_body.is_none(), "未知模型不得发任何网络请求（连探测都不必）");
+}
+
+/// MAX_TOKENS finishReason → OpenAI "length"（mapGeminiFinish 的 OpenAI 词汇版）。
+#[tokio::test]
+async fn max_tokens_finish_reason_maps_to_length() {
+    let cap = Arc::new(Mutex::new(Stub::default()));
+    let app = Router::new()
+        .route(
+            "/v1internal:streamGenerateContent",
+            post(|| async {
+                let sse = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"截\"}],\"role\":\"model\"},\"finishReason\":\"MAX_TOKENS\"}]}\n\n";
+                ([("content-type", "text/event-stream")], sse)
+            }),
+        )
+        .route("/v1internal:loadCodeAssist", post(|| async { Json(json!({})) }))
+        .with_state(cap.clone());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("stub serve") });
+    let out = pv(format!("http://{addr}")).complete(&cred(), &route(), &req()).await.unwrap();
+    assert_eq!(out.choices[0].finish_reason.as_deref(), Some("length"));
+}
+
 #[tokio::test]
 async fn envelope_carries_generation_config_and_short_user_agent() {
     let (base, cap) = spawn().await;

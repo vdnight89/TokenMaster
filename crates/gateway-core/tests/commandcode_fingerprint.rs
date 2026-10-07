@@ -8,7 +8,8 @@
 //!   field)`；候选池选择按 digest **字节序取最大**（非取模）；指纹由 apiKey
 //!   确定性派生而非随机（重启/恢复上游看到同一台设备——换指纹本身可疑）。
 //! - 上报节奏：首次请求前并行发 fingerprint/record + lifecycle-events
-//!   （各自失败仅告警不阻塞）；成功后 8h + rand(0..2h) 内不再上报。
+//!   （各自失败仅告警不阻塞）；Promise.all 后**无论成败**都写 nextInitAt，
+//!   8h + rand(0..2h) 内不再上报（proxy.mjs:417-451）。
 
 use std::sync::{Arc, Mutex};
 
@@ -171,6 +172,17 @@ async fn fingerprint_and_lifecycle_reported_before_first_generate() {
     let fp = s.fp_body.clone().unwrap();
     assert!(fp["thumbmark"].as_str().unwrap().len() == 64, "thumbmark 是 sha256 hex");
     let c = &fp["components"];
+    // 键序逐字对照 proxy.mjs:171-189（preserve_order 下 wire 上可观测）
+    let keys: Vec<&str> = c.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        vec![
+            "machineIdHash", "macHashes", "osUserHash", "hostnameHash", "gitEmailHash",
+            "platform", "arch", "osRelease", "cpuModel", "cpuCount", "memGiB",
+            "isContainer", "timezone", "runtime", "collectorVersion",
+        ],
+        "components 键序与参考一致"
+    );
     // 形状逐字对照 proxy.mjs:170-189：哈希键 + 原样键 + 数字键 + 环境键
     assert!(c.get("machineIdHash").is_some());
     assert!(c["macHashes"].as_array().unwrap().iter().all(|h| h.as_str().unwrap().len() == 64), "MAC 逐条哈希成数组");
@@ -221,6 +233,21 @@ async fn report_failure_does_not_block_inference() {
     cap.seen.lock().unwrap().report_fail = true;
     let out = pv(base).complete(&cred(), &route(), &req()).await.unwrap();
     assert!(out.choices[0].message.content.contains("ok"), "上报失败仅告警不阻塞");
+}
+
+#[tokio::test]
+async fn next_init_at_written_even_when_report_fails() {
+    let (base, cap) = spawn().await;
+    cap.seen.lock().unwrap().report_fail = true;
+    let p = pv(base);
+    p.complete(&cred(), &route(), &req()).await.unwrap();
+    p.complete(&cred(), &route(), &req()).await.unwrap();
+    let s = cap.seen.lock().unwrap();
+    // 对齐 proxy.mjs:417-451：单项失败只 log warn，Promise.all 后**无条件**写
+    // nextInitAt（8h+抖动）——失败后 8h 内不重试上报（下次请求直接进 generate）
+    let fp_count = s.order.iter().filter(|o| **o == "fingerprint").count();
+    assert_eq!(fp_count, 1, "上报失败也写 nextInitAt，不逐请求重试");
+    assert_eq!(s.order.iter().filter(|o| **o == "generate").count(), 2);
 }
 
 #[tokio::test]

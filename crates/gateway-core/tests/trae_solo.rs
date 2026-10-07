@@ -4,14 +4,17 @@
 //!   model→config_name+model 双字段（`__dev` 后缀消除）、content 字符串→
 //!   `[{type:"text"}]`、assistant tool_calls function→function_call（无 name
 //!   剔除、全剔删键）、tool_choice 归一（none 删 tools）、tools.parameters
-//!   对象→JSON 字符串、max_tokens 钳 64000。
+//!   对象→JSON 字符串、max_tokens 钳 64000；**不写 reasoning_content**
+//!   （serializeTraeMessages/transformSOLOMessage 均不序列化思考）。
 //! - `traeSOLOHeaders`（:204）：产品常量实测值 + X-Machine-Id 可轮换派生。
 //! - `parseTraeSSELine`（:1743）：event/data 行；output{response,
 //!   reasoning_content,tool_calls}、token_usage{prompt_tokens,
 //!   completion_tokens}、done{finish_reason}、error{code,message}；
 //!   tool_calls 归一 function_call→function、删 namespace/partial_arguments。
-//! - 错误分类（trae-errors.ts + cooldown-table）：4008→24h、1005→12h、
-//!   4011→60s、会话死亡标记→重登。
+//! - 错误分类（trae-errors.ts:80-126 + cooldown-table）：业务码先于状态码；
+//!   4008→24h、1005→12h、4011→60s、4001=模型不可调用（BadRequest 不换号）、
+//!   401/会话失效标记→重登。
+//! - Max 模式成套字段（trae.ts:1508-1525）：strategy=max + 三件套。
 
 use std::sync::{Arc, Mutex};
 
@@ -24,8 +27,9 @@ use futures::StreamExt;
 use gateway_core::openai::ChatRequest;
 use gateway_core::provider::{Provider, ProviderError, StreamChunk};
 use gateway_core::providers::trae::{
-    classify_trae_error, derive_rotating_machine_id, TraeProvider,
-    TRAE_MAX_COMPLETION_TOKENS,
+    classify_trae_error, derive_rotating_machine_id, parse_solo_sse, trae_max_mode_fields,
+    TraeProvider, TRAE_MAX_COMPLETION_TOKENS, TRAE_MAX_CONTEXT_TOKENS,
+    TRAE_MAX_MODE_OUTPUT_TOKENS, TRAE_MAX_MODE_TYPE, TRAE_MAX_PROMPT_TOKENS,
 };
 use gateway_core::route::Route;
 use gateway_core::Credential;
@@ -102,7 +106,7 @@ fn solo_req() -> ChatRequest {
         }],
         "messages": [
             { "role": "user", "content": "查一下" },
-            { "role": "assistant", "content": null, "tool_calls": [
+            { "role": "assistant", "content": null, "reasoning_content": "上一轮思考不该回传", "tool_calls": [
                 { "id": "tc0", "type": "function", "function": { "name": "bash", "arguments": "{\"cmd\":\"ls\"}" } },
                 { "id": "bad", "type": "function", "function": { "arguments": "{}" } }
             ]},
@@ -136,6 +140,12 @@ async fn solo_body_transform_matches_reference() {
     assert_eq!(msgs[0]["content"], json!([{ "type": "text", "text": "查一下" }]));
     // assistant：content null 跳过键；tool_calls function→function_call；无 name 剔除
     assert!(msgs[1].get("content").is_none(), "null content 跳过键");
+    // 输入消息不写 reasoning_content（参考 serializeTraeMessages /
+    // transformSOLOMessage 均不写该键；思考回传上游会污染上下文）
+    assert!(
+        msgs.iter().all(|m| m.get("reasoning_content").is_none()),
+        "reasoning_content 不得序列化进上游请求体"
+    );
     let tcs = msgs[1]["tool_calls"].as_array().unwrap().clone();
     assert_eq!(tcs.len(), 1, "无 function_call.name 的 tool_call 剔除");
     assert_eq!(tcs[0]["function_call"]["name"], json!("bash"), "SOLO 字段名 function_call");
@@ -200,7 +210,8 @@ async fn sse_events_translate_to_stream_chunks() {
 async fn error_event_classified_with_cooldowns() {
     let (base, cap) = spawn().await;
     drop(cap.lock().unwrap());
-    // 直接对分类函数断言（SSE error 事件 → classify）
+    // 直接对分类函数断言（SSE error 事件 → classify）。
+    // 业务码先于状态码与会话死亡判定（trae-errors.ts:80-126 判定顺序）。
     assert!(matches!(
         classify_trae_error(200, Some(4008), "quota exceeded"),
         ProviderError::RateLimited { retry_after_secs: Some(86_400), .. }
@@ -217,7 +228,46 @@ async fn error_event_classified_with_cooldowns() {
         classify_trae_error(200, None, "please login again"),
         ProviderError::Credential(_)
     ));
+    // 401 状态码无条件判会话死亡（参考规则 4：标记词只在 401 分支内起作用）
+    assert!(matches!(classify_trae_error(401, None, "whatever"), ProviderError::Credential(_)));
+    // 含 "4011" 的消息不得被裸 "401" 子串误判成会话死亡（无结构化 code 时）
+    assert!(
+        matches!(classify_trae_error(400, None, "frequency limit 4011"), ProviderError::BadRequest(_)),
+        "4011 字样不能误触发 session-dead"
+    );
+    // 4001 = 模型不可调用（trae-adapter.ts:556-575/222-224：换号无意义，
+    // 不冷却、不可重试）
+    match classify_trae_error(200, Some(4001), "We're sorry, the param is invalid.") {
+        ProviderError::BadRequest(msg) => {
+            assert!(msg.contains("模型不可调用") || msg.contains("not callable"), "4001 语义须指向模型：{msg}")
+        }
+        other => panic!("4001 → BadRequest（模型不可调用）：{other:?}"),
+    }
     let _ = (base, cap);
+}
+
+#[test]
+fn max_mode_fields_form_complete_strategy_bundle() {
+    // Max 模式成套字段（trae.ts:1508-1525）：strategy=max 判定 + 三件套
+    // （context_window_size / prompt_max_tokens / max_tokens）缺一不可，
+    // 只调大 max_tokens 会被当普通会话按 200K 校验。
+    let v = trae_max_mode_fields(TRAE_MAX_CONTEXT_TOKENS, None);
+    assert_eq!(v["model_auto_selection"]["strategy"], json!("max"));
+    assert_eq!(v["model_auto_selection"]["fallback_to_advance_model"], json!(null));
+    assert_eq!(v["model_auto_selection"]["entitlement_id"], json!(null));
+    assert_eq!(v["model_selection_strategy"], json!("max"));
+    assert_eq!(v["mode_type"], json!(TRAE_MAX_MODE_TYPE));
+    assert_eq!(v["context_window_size"], json!(TRAE_MAX_CONTEXT_TOKENS));
+    assert_eq!(v["prompt_max_tokens"], json!(TRAE_MAX_PROMPT_TOKENS));
+    assert_eq!(v["max_tokens"], json!(TRAE_MAX_MODE_OUTPUT_TOKENS), "缺省输出上限 64K");
+    // 远端声明的 Max 窗口与输出上限优先
+    let v2 = trae_max_mode_fields(1_000_000, Some(384_000));
+    assert_eq!(v2["context_window_size"], json!(1_000_000));
+    assert_eq!(v2["max_tokens"], json!(384_000));
+    // 非法窗口/输出回退默认（trae.ts:1512/1523 的 >0 判据）
+    let v3 = trae_max_mode_fields(0, Some(0));
+    assert_eq!(v3["context_window_size"], json!(TRAE_MAX_CONTEXT_TOKENS));
+    assert_eq!(v3["max_tokens"], json!(TRAE_MAX_MODE_OUTPUT_TOKENS));
 }
 
 #[test]
@@ -233,6 +283,19 @@ fn rotating_machine_id_derivation() {
     h.update(format!("{base}#machine1"));
     let expect = format!("{:x}", h.finalize())[..32].to_string();
     assert_eq!(g1, expect);
+}
+
+#[test]
+fn sse_parser_tolerates_crlf_line_endings() {
+    // 真实上游可能用 CRLF 行尾；不剥 \r 会让事件分隔行失效、事件名带 \r
+    // （对齐参考 consumeSse 的 line.trim()）。
+    let text = "event: output\r\ndata: {\"response\":\"好\"}\r\n\r\nevent: done\r\ndata: {\"finish_reason\":\"stop\"}\r\n\r\n";
+    let events = parse_solo_sse(text);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].event, "output");
+    assert_eq!(events[0].response.as_deref(), Some("好"));
+    assert_eq!(events[1].event, "done");
+    assert_eq!(events[1].finish_reason.as_deref(), Some("stop"));
 }
 
 #[tokio::test]
