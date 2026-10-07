@@ -4,4 +4,5 @@
 pub mod commandcode;
 pub mod trae;
 pub mod gemini;
+pub mod qoder;
 pub mod zcode;
