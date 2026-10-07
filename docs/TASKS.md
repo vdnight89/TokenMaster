@@ -108,6 +108,13 @@
 | T7.2 | release profile（strip/lto）+ 冷启动/包体检查 | — | todo | T7.1 |
 | T7.3 | 用户文档（README 安装/接入/FAQ 更新）+ ADR 补充 | — | todo | T7.1 |
 
+## M8 校验与集成测试（用户指定）
+
+| # | 任务 | 缝 | 状态 | 依赖 |
+|---|---|---|---|---|
+| T8.1 | 子智能体群校验：每 provider 一个代理，①对比参考项目实现找问题并修复 ②全代码 code-review 修复 ③复测修复（并行，各改各家文件） | 2 | todo | T4.16-T4.20 |
+| T8.2 | 集成测试与功能测试：workspace 全量 + 各 provider stub 链路回归 + 网关缝 1 黑盒全量 | 1,2 | todo | T8.1 |
+
 ## 集成关卡（里程碑门禁）
 
 每完成一个里程碑（M0-M7）：`cargo test --workspace` + `cargo clippy --workspace` + `pnpm check` + `pnpm build` 四项全绿才算关；失败就地修复后重跑。M5 页面每完成一页，用 oil-ui-pro 截图工具对该页做视觉自查（对照 round-02 原型同页截图）。
