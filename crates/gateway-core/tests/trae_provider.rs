@@ -38,10 +38,20 @@ async fn stub_balance(State(cap): State<Arc<Mutex<Cap>>>, body: axum::extract::R
         StatusCode::OK,
         Json(json!({
             "code": 0,
-            "data": [
-                { "credits_limit": 100, "credits_amount": 30 },
-                { "credits_limit": 50, "credits_amount": 10 }
-            ]
+            "data": {
+                "user_entitlement_pack_list": [
+                    {
+                        "entitlement_base_info": { "quota": { "credits_limit": 100 } },
+                        "usage": { "credits_amount": 30 },
+                        "expire_time": 1893456000
+                    },
+                    {
+                        "entitlement_base_info": { "quota": { "credits_limit": 50 } },
+                        "usage": { "credits_amount": 10 },
+                        "expire_time": 1893456001
+                    }
+                ]
+            }
         })),
     )
         .into_response()

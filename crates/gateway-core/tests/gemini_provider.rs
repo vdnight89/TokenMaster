@@ -65,7 +65,7 @@ fn pv(base: String) -> GeminiProvider {
 
 fn req() -> ChatRequest {
     serde_json::from_value(json!({
-        "model": "gemini/gemini-3-pro",
+        "model": "gemini/gemini-3.8-flash",
         "messages": [
             { "role": "system", "content": "你是助手" },
             { "role": "user", "content": "打招呼" }
@@ -75,7 +75,7 @@ fn req() -> ChatRequest {
 }
 
 fn route() -> Route {
-    Route { provider: "gemini".into(), model: "gemini-3-pro".into() }
+    Route { provider: "gemini".into(), model: "gemini-3.8-flash".into() }
 }
 
 fn cred() -> Credential {
@@ -92,7 +92,7 @@ async fn envelope_is_alphabetical_with_suffix_and_system_instruction() {
     let v: Value = serde_json::from_str(raw).unwrap();
 
     // 模型名带档位后缀（准入键）
-    assert!(v["model"].as_str().unwrap().starts_with("gemini-3-pro-"), "model: {}", v["model"]);
+    assert!(v["model"].as_str().unwrap().starts_with("gemini-3.8-flash-"), "model: {}", v["model"]);
     // 双层信封根键字母序：model < project < request < requestId < userAgent
     let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
     let mut sorted = keys.clone();

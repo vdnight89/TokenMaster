@@ -64,7 +64,29 @@ async fn balance(
     if !headers.contains_key("x-device-mid") {
         return (StatusCode::BAD_REQUEST, Json(json!({ "code": 3001 }))).into_response();
     }
-    Json(json!({ "data": { "total": 100_000_000, "used": 37_500_000 } })).into_response()
+    // 参考实测形状（upstream.ts:256-330）：data.balances[] 桶
+    Json(json!({
+        "code": 0,
+        "data": {
+            "displayMode": "personal",
+            "balances": [
+                {
+                    "plan_id": "start-plan-trust-1003",
+                    "show_name": "ZCode 免费额度",
+                    "unit_type": "token", "meter": "model_usage",
+                    "total_units": 100_000_000, "used_units": 37_500_000,
+                    "remaining_units": 62_500_000, "available_units": 62_500_000,
+                    "expires_at": 1893456000
+                },
+                {
+                    "plan_id": "pack-extra",
+                    "unit_type": "token",
+                    "total_units": 10_000_000, "used_units": 0,
+                    "remaining_units": 10_000_000
+                }
+            ]
+        }
+    })).into_response()
 }
 
 async fn spawn() -> (String, Arc<Mutex<Stub>>) {
@@ -111,8 +133,12 @@ async fn balance_sends_identity_and_parses_tokens() {
     let pv = ZcodeProvider::new(base);
     let cred = Credential { account_id: "a".into(), secret: "jwt".into() };
     let b: ZcodeBalance = pv.balance(&cred).await.unwrap();
-    assert_eq!(b.total_tokens, 100_000_000);
-    assert_eq!(b.used_tokens, 37_500_000);
+    assert_eq!(b.remaining, 72_500_000, "Σ(available)：62.5M + 10M");
+    assert_eq!(b.total, 110_000_000);
+    assert_eq!(b.expires_at, Some(1893456000), "最早到期");
+    assert_eq!(b.buckets.len(), 2);
+    assert_eq!(b.buckets[0].unit_type.as_deref(), Some("token"), "单位是 token 不是积分");
+    assert!(!b.enterprise);
     let headers = st.lock().unwrap().balance_headers.clone().unwrap();
     assert!(headers.contains_key("x-device-mid"), "缺 X-Device-Mid 上游 400/3001");
 }

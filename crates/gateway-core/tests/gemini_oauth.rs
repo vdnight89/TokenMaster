@@ -50,6 +50,7 @@ fn oauth(token_url: String) -> GeminiOAuth {
         "https://accounts.google.com/o/oauth2/v2/auth".into(),
         token_url,
         "client-x".into(),
+        "secret-x".into(),
         vec!["cloud-platform".into(), "cclog".into()],
     )
 }
@@ -66,6 +67,7 @@ async fn exchange_code_posts_standard_grant_and_builds_credential() {
         "grant_type=authorization_code",
         "code=code-xyz",
         "client_id=client-x",
+        "client_secret=secret-x",
         "redirect_uri=http%3A%2F%2F127.0.0.1%3A45678",
     ] {
         assert!(form.contains(expect), "交换请求缺 {expect}：{form}");
@@ -113,6 +115,7 @@ async fn refresh_without_new_rt_keeps_old() {
         "https://a".into(),
         format!("http://{addr}/token"),
         "client-x".into(),
+        "secret-x".into(),
         vec![],
     )
     .refresh(&Credential { account_id: "g1".into(), secret })
@@ -135,6 +138,7 @@ async fn login_url_carries_auth_params() {
         "scope=cloud-platform+cclog",
         "state=st-9",
         "access_type=offline",
+        "include_granted_scopes=true",
     ] {
         assert!(url.contains(expect), "授权 URL 缺 {expect}：{url}");
     }
@@ -196,7 +200,13 @@ async fn callback_login_flow_end_to_end() {
     let (url, rx) = oa.start_login().await;
     // 从授权 URL 提取 redirect_uri（回环端口）与 state，模拟浏览器重定向
     let redirect = url.split("redirect_uri=").nth(1).unwrap().split('&').next().unwrap();
-    let callback = redirect.replace("%3A", ":").replace("%2F", "/");
+    // redirect_uri 形态必须 localhost + /oauth-callback（client 注册值）
+    let decoded = redirect.replace("%3A", ":").replace("%2F", "/");
+    assert!(
+        decoded.starts_with("http://localhost:") && decoded.ends_with("/oauth-callback"),
+        "redirect_uri 形态：{decoded}"
+    );
+    let callback = decoded.replace("localhost", "127.0.0.1");
     let state = url.split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
     let http = reqwest::Client::new();
     let resp = http
@@ -217,7 +227,7 @@ async fn callback_rejects_state_mismatch() {
     let oa = oauth(token_url);
     let (url, rx) = oa.start_login().await;
     let redirect = url.split("redirect_uri=").nth(1).unwrap().split('&').next().unwrap();
-    let callback = redirect.replace("%3A", ":").replace("%2F", "/");
+    let callback = redirect.replace("%3A", ":").replace("%2F", "/").replace("localhost", "127.0.0.1");
     let http = reqwest::Client::new();
     let resp = http
         .get(format!("{callback}?code=evil&state=forged"))

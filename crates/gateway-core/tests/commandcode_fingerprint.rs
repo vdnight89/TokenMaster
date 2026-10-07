@@ -170,7 +170,23 @@ async fn fingerprint_and_lifecycle_reported_before_first_generate() {
     assert_eq!(s.order, vec!["fingerprint", "lifecycle", "generate"], "首次请求前并行上报");
     let fp = s.fp_body.clone().unwrap();
     assert!(fp["thumbmark"].as_str().unwrap().len() == 64, "thumbmark 是 sha256 hex");
-    assert!(fp["components"].is_object(), "components 必须携带");
+    let c = &fp["components"];
+    // 形状逐字对照 proxy.mjs:170-189：哈希键 + 原样键 + 数字键 + 环境键
+    assert!(c.get("machineIdHash").is_some());
+    assert!(c["macHashes"].as_array().unwrap().iter().all(|h| h.as_str().unwrap().len() == 64), "MAC 逐条哈希成数组");
+    assert!(c.get("hostnameHash").is_some());
+    assert!(c.get("osUserHash").is_some());
+    assert!(c.get("gitEmailHash").is_some());
+    assert_eq!(c["platform"], json!("win32"));
+    assert_eq!(c["arch"], json!("x64"));
+    assert_eq!(c["osRelease"], json!("10.0.22631"));
+    assert_eq!(c["isContainer"], json!(false));
+    assert!(c["cpuModel"].as_str().unwrap().contains("Intel") || c["cpuModel"].as_str().unwrap().contains("AMD"), "cpuModel 原样");
+    assert!(c["cpuCount"].is_u64(), "cpuCount 数字");
+    assert!(c["memGiB"].is_u64(), "memGiB 数字");
+    assert!(c["timezone"].as_str().unwrap().contains('/'), "timezone 原样");
+    assert_eq!(c["runtime"], json!("cli"));
+    assert_eq!(c["collectorVersion"], json!(1));
     let lc = s.lc_body.clone().unwrap();
     assert_eq!(lc["eventType"], json!("cli_session_exists"));
     let meta = &lc["metadata"];

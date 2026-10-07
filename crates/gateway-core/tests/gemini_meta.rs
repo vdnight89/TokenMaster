@@ -166,23 +166,22 @@ async fn detection_cached_across_requests() {
 }
 
 #[tokio::test]
-async fn quota_summary_posts_empty_object_with_identity_headers() {
+async fn quota_summary_posts_project_with_identity_headers() {
     let (base, cap) = spawn(LoadMode::Empty, 200).await;
-    let v = pv(base).quota_summary(&cred()).await.unwrap();
+    let v = pv(base).quota_summary(&cred(), "aicode-consumers").await.unwrap();
     assert_eq!(v["windows"][0]["pct"], json!(42));
     let s = cap.1.lock().unwrap();
     assert_eq!(s.quota_count, 1);
-    assert_eq!(s.quota_body.as_deref().unwrap(), "{}", "配额请求体必须是空对象");
+    let qb = s.quota_body.as_deref().unwrap();
+    assert!(qb.contains("\"project\":\"aicode-consumers\""), "配额请求体必须带 project（空对象部分账号 403）：{qb}");
     let h = s.quota_headers.as_ref().unwrap();
     assert!(h.get("authorization").unwrap().to_str().unwrap().starts_with("Bearer "));
     assert_eq!(h.get("user-agent").unwrap().to_str().unwrap(), "antigravity/4.3.0 (cmdc-pak)");
-    // 请求体不带 project：空对象即无该键
-    assert!(!s.quota_body.as_deref().unwrap().contains("project"));
 }
 
 #[tokio::test]
 async fn quota_unauthorized_maps_to_credential_error() {
     let (base, _) = spawn(LoadMode::Empty, 401).await;
-    let err = pv(base).quota_summary(&cred()).await.unwrap_err();
+    let err = pv(base).quota_summary(&cred(), "aicode-consumers").await.unwrap_err();
     assert!(matches!(err, ProviderError::Credential(_)), "{err:?}");
 }

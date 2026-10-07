@@ -256,7 +256,8 @@ impl GeminiProvider {
             .client
             .post(format!("{}{}", self.base, LOAD_PATH))
             .headers(self.identity_headers(cred))
-            .json(&Value::Object(Map::new()))
+            // 逐字常量（gemini.ts:97；多字段可能被识别为非官方客户端）
+            .json(&serde_json::json!({ "metadata": { "ideType": "ANTIGRAVITY" } }))
             .send()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
@@ -274,7 +275,12 @@ impl GeminiProvider {
     /// 200 但无 `cloudaicompanionProject` 时用兜底值。
     pub async fn detect_project(&self, cred: &Credential) -> Result<String, ProviderError> {
         let v = self.load_code_assist(cred).await?;
-        let detected = v.get("cloudaicompanionProject").and_then(Value::as_str).unwrap_or("");
+        // 两级取值：顶层 → currentTier 嵌套（gemini-project.ts:72-83）
+        let detected = v
+            .get("cloudaicompanionProject")
+            .and_then(Value::as_str)
+            .or_else(|| v.pointer("/currentTier/cloudaicompanionProject").and_then(Value::as_str))
+            .unwrap_or("");
         let project = if detected.is_empty() {
             self.fallback_project.clone()
         } else {
@@ -295,12 +301,14 @@ impl GeminiProvider {
     /// 配额摘要（5h/周双窗口百分比，单位 '%' 不参与积分归一）。
     /// 请求体固定空对象 `{}` 且不带 project；响应 schema 参考实现未在手册给出
     /// 完整字段表，原样透传 JSON 供 GUI 接线时以真实响应校准。
-    pub async fn quota_summary(&self, cred: &Credential) -> Result<Value, ProviderError> {
+    pub async fn quota_summary(&self, cred: &Credential, project: &str) -> Result<Value, ProviderError> {
+        // 请求体必须带 project（字段名是 project 不是 cloudaicompanionProject，
+        // 空对象对部分账号回 403 SUBSCRIPTION_REQUIRED——gemini-credits.ts:12-29）
         let resp = self
             .client
             .post(format!("{}{}", self.base, QUOTA_PATH))
             .headers(self.identity_headers(cred))
-            .json(&Value::Object(Map::new()))
+            .json(&serde_json::json!({ "project": project }))
             .send()
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
@@ -614,10 +622,8 @@ impl Provider for GeminiProvider {
     fn catalog(&self) -> ProviderCatalog {
         ProviderCatalog {
             id: "gemini".into(),
-            models: vec![
-                ModelInfo { id: "gemini-3-pro".into() },
-                ModelInfo { id: "gemini-3-flash".into() },
-            ],
+            // 上游准入表只认 gemini-3.8-flash（gemini.ts:460-554，其余必 404）
+            models: vec![ModelInfo { id: "gemini-3.8-flash".into() }],
         }
     }
 
@@ -709,9 +715,24 @@ pub struct GeminiOAuth {
     auth_url: String,
     token_url: String,
     client_id: String,
+    client_secret: String,
     scopes: Vec<String>,
     client: reqwest::Client,
 }
+
+/// 公开 OAuth 客户端 id（gemini-oauth.ts:36；client_secret 除外——那个走 env）。
+pub const DEFAULT_CLIENT_ID: &str =
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+
+/// 六项 scope 逐字清单（gemini-oauth.ts:59-66，空格连接下发）。
+pub const SCOPES: [&str; 6] = [
+    "openid",
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/cclog",
+    "https://www.googleapis.com/auth/experimentsandconfigs",
+];
 
 /// 解析凭据 secret：JSON 形态取 (access_token, Some(refresh_token))；
 /// 非 JSON 按裸 access_token 回退（历史/手工凭据兼容）。
@@ -745,8 +766,14 @@ fn now_ts_secs() -> u64 {
 }
 
 impl GeminiOAuth {
-    pub fn new(auth_url: String, token_url: String, client_id: String, scopes: Vec<String>) -> Self {
-        Self { auth_url, token_url, client_id, scopes, client: reqwest::Client::new() }
+    pub fn new(
+        auth_url: String,
+        token_url: String,
+        client_id: String,
+        client_secret: String,
+        scopes: Vec<String>,
+    ) -> Self {
+        Self { auth_url, token_url, client_id, client_secret, scopes, client: reqwest::Client::new() }
     }
 
     /// 生产配置：Google 固定端点；client_id 经 `CMDC_PAK_GOOGLE_CLIENT_ID`
@@ -755,8 +782,12 @@ impl GeminiOAuth {
         Self::new(
             "https://accounts.google.com/o/oauth2/v2/auth".into(),
             "https://oauth2.googleapis.com/token".into(),
-            std::env::var("CMDC_PAK_GOOGLE_CLIENT_ID").unwrap_or_default(),
-            Vec::new(), // 六项 scope 逐字清单待用户提供（见类型文档）
+            std::env::var("CMDC_PAK_GOOGLE_CLIENT_ID")
+                .unwrap_or_else(|_| DEFAULT_CLIENT_ID.into()),
+            // client_secret 不进源码（红线/平台密钥拦截）：经 env 注入。
+            // 值的出处见 docs/provider-gap-analysis.md §二。
+            std::env::var("CMDC_PAK_GOOGLE_CLIENT_SECRET").unwrap_or_default(),
+            SCOPES.iter().map(|s| s.to_string()).collect(),
         )
     }
 
@@ -764,7 +795,7 @@ impl GeminiOAuth {
     /// prompt=consent 保证离线授权下发）。
     pub fn login_url(&self, redirect_uri: &str, state: &str) -> String {
         format!(
-            "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&access_type=offline&prompt=consent",
+            "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&state={}&access_type=offline&include_granted_scopes=true&prompt=consent",
             self.auth_url,
             form_enc(&self.client_id),
             form_enc(redirect_uri),
@@ -824,7 +855,9 @@ impl GeminiOAuth {
             .await
             .expect("bind loopback callback");
         let port = listener.local_addr().unwrap().port();
-        let redirect_uri = format!("http://127.0.0.1:{port}");
+        // redirect_uri 必须逐字 localhost + /oauth-callback（client 注册值，
+        // 用 127.0.0.1 或无路径会 redirect_uri_mismatch——gemini-oauth.ts:41-44）
+        let redirect_uri = format!("http://localhost:{port}/oauth-callback");
         let state = crate::key::random_id(12);
         let url = self.login_url(&redirect_uri, &state);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -832,7 +865,7 @@ impl GeminiOAuth {
         let this = self.clone();
         let expected_state = state.clone();
         let app = axum::Router::new().route(
-            "/",
+            "/oauth-callback",
             axum::routing::get(
                 move |axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| {
                     let tx = tx.clone();
@@ -846,8 +879,7 @@ impl GeminiOAuth {
                         if got_state != &expected_state {
                             return (axum::http::StatusCode::FORBIDDEN, "state mismatch");
                         }
-                        // redirect_uri 与授权时一致（同端口）
-                        let res = this.exchange_code(code, &format!("http://127.0.0.1:{port}")).await;
+                        let res = this.exchange_code(code, &format!("http://localhost:{port}/oauth-callback")).await;
                         if let Some(tx) = tx.lock().unwrap().take() {
                             let _ = tx.send(res);
                         }
@@ -869,6 +901,7 @@ impl GeminiOAuth {
                 ("grant_type", "authorization_code"),
                 ("code", code),
                 ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
                 ("redirect_uri", redirect_uri),
             ])
             .await?;
@@ -887,6 +920,7 @@ impl GeminiOAuth {
                 ("grant_type", "refresh_token"),
                 ("refresh_token", rt.as_str()),
                 ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
             ])
             .await?;
         self.credential_from(&v, Some(&rt), &cred.account_id)

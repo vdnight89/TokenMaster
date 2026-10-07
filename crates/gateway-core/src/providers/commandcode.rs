@@ -32,11 +32,15 @@ const DEFAULT_PROJECT_DIR: &str = r"C:\Users\dev\projects\app";
 const DEFAULT_MAX_TOKENS: u64 = 64000;
 const MAX_TOKENS_CAP: u64 = 200000;
 
-/// 工具名别名表（toWireToolName）。手册 §4.2 只逐字载明
-/// `bash_output→shell_output` 一条，其余 3 条原文未载明——拿到原文后补齐。
+/// 工具名别名表（proxy.mjs:714-721 逐字，共 4 条）。
+/// ⚠️ 只在 **tools 声明** 做别名；消息体 tool-call/tool-result 的 toolName
+/// 用原始名（proxy.mjs:612/558-560）。
 fn wire_tool_name(n: &str) -> &str {
     match n {
         "bash_output" => "shell_output",
+        "task_output" => "shell_output",
+        "tool_search" => "search_tools",
+        "read_multiple_files" => "read_file",
         other => other,
     }
 }
@@ -75,8 +79,7 @@ pub fn map_finish_reason(r: &str) -> String {
     match r {
         "tool-calls" | "tool_calls" | "tool_use" => "tool_calls".into(),
         "length" | "max_tokens" | "max_output_tokens" | "model_context_window_exceeded" => "length".into(),
-        // OpenAI 无对应枚举；折 stop 是谎报完成（§7 坑 9）
-        "pause_turn" => "length".into(),
+        // pause_turn 原样保留（proxy.mjs:926/937：折 stop/length 都是谎报）
         other => other.into(),
     }
 }
@@ -182,7 +185,7 @@ fn tool_name_map(req: &ChatRequest) -> std::collections::HashMap<String, String>
                     c.get("id").and_then(Value::as_str),
                     c.pointer("/function/name").and_then(Value::as_str),
                 ) {
-                    map.insert(id.to_string(), wire_tool_name(name).to_string());
+                    map.insert(id.to_string(), name.to_string());
                 }
             }
         }
@@ -212,17 +215,18 @@ fn cc_messages(req: &ChatRequest) -> Vec<Value> {
                 if let Some(Value::Array(calls)) = &m.tool_calls {
                     for c in calls {
                         let id = c.get("id").and_then(Value::as_str).unwrap_or_default();
+                        // 消息体 toolName 用原始名（别名只在 tools 声明做）
                         let name = c
                             .pointer("/function/name")
                             .and_then(Value::as_str)
-                            .map(wire_tool_name)
                             .unwrap_or_default();
                         let args_raw = c
                             .pointer("/function/arguments")
                             .and_then(Value::as_str)
                             .unwrap_or("{}");
+                        // 解析失败发 {}（参考 tryParseJSON 兜底）
                         let input: Value = serde_json::from_str(args_raw)
-                            .unwrap_or(Value::String(args_raw.to_string()));
+                            .unwrap_or_else(|_| serde_json::json!({}));
                         blocks.push(serde_json::json!({
                             "type": "tool-call", "toolCallId": id, "toolName": name, "input": input
                         }));
@@ -235,10 +239,14 @@ fn cc_messages(req: &ChatRequest) -> Vec<Value> {
                 let mut tr = Map::new();
                 tr.insert("type".into(), Value::String("tool-result".into()));
                 tr.insert("toolCallId".into(), Value::String(id));
-                // 查不到名字时省略 name 键（§7 坑 7：硬塞空名上游报错）
-                if let Some(n) = m.tool_call_id.as_deref().and_then(|i| names.get(i)) {
-                    tr.insert("toolName".into(), Value::String(n.clone()));
-                }
+                // 查不到名字发空串（参考 proxy.mjs:625：msg.name || ''）
+                let name = m
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|i| names.get(i))
+                    .cloned()
+                    .unwrap_or_default();
+                tr.insert("toolName".into(), Value::String(name));
                 tr.insert(
                     "output".into(),
                     serde_json::json!({ "type": "text", "value": m.text() }),
@@ -336,6 +344,7 @@ fn parse_ndjson(body: &str) -> NdjsonOut {
         finish: None,
         upstream_error: None,
     };
+    let mut step_usage: Option<Usage> = None;
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -361,9 +370,23 @@ fn parse_ndjson(body: &str) -> NdjsonOut {
                 };
                 out.tool_calls.push((id, name, args));
             }
+            // finish-step 也是完成信号（proxy.mjs:808-818）：流只到它即正常
+            // 完成；后续显式 finish 到达时覆盖（usage 回退见 finish 分支）。
+            "finish-step" => {
+                step_usage = v.get("usage").map(cc_usage);
+                let reason = v.get("finishReason").and_then(Value::as_str).unwrap_or_default();
+                if !reason.is_empty() && out.finish.is_none() && !is_upstream_error_reason(reason) {
+                    out.finish = Some((map_finish_reason(reason), step_usage.unwrap_or_default()));
+                }
+            }
             "finish" => {
                 let reason = v.get("finishReason").and_then(Value::as_str).unwrap_or_default();
-                let usage = v.get("totalUsage").map(cc_usage).unwrap_or_default();
+                // totalUsage 缺失时回退 finish-step 的 usage（proxy.mjs:823）
+                let usage = v
+                    .get("totalUsage")
+                    .map(cc_usage)
+                    .or(step_usage)
+                    .unwrap_or_default();
                 if is_upstream_error_reason(reason) {
                     out.upstream_error = Some(ProviderError::Upstream(format!("upstream error finish: {reason}")));
                 } else {
@@ -556,21 +579,37 @@ impl CommandcodeProvider {
     /// 设备指纹上报：thumbmark + components（逐信号哈希，空值省略键）。
     async fn report_fingerprint(&self, cred: &Credential) -> Result<(), ProviderError> {
         let profile = derive_device_profile(&cred.secret, "");
+        // 形状逐字对照 proxy.mjs:170-189：*Hash 哈希键 + 原样键 + 数字键 +
+        // platform/arch/osRelease/isContainer/runtime/collectorVersion。
         let mut components = Map::new();
-        for (k, v) in [
-            ("machineId", Some(profile.machine_id.clone())),
-            ("macs", Some(profile.macs.join(","))),
-            ("hostname", Some(profile.hostname.clone())),
-            ("cpuModel", Some(profile.cpu_model.clone())),
-            ("memoryGb", Some(profile.memory_gb.to_string())),
-            ("timezone", Some(profile.timezone.clone())),
-            ("osUser", Some(profile.os_user.clone())),
-            ("gitEmail", Some(profile.git_email.clone())),
-        ] {
-            if let Some(hv) = v.as_deref().and_then(fingerprint_hash) {
-                components.insert(k.into(), Value::String(hv));
-            }
+        if let Some(h) = fingerprint_hash(&profile.machine_id) {
+            components.insert("machineIdHash".into(), Value::String(h));
         }
+        let mac_hashes: Vec<Value> = profile
+            .macs
+            .iter()
+            .filter_map(|m| fingerprint_hash(m).map(Value::String))
+            .collect();
+        components.insert("macHashes".into(), Value::Array(mac_hashes));
+        if let Some(h) = fingerprint_hash(&profile.hostname) {
+            components.insert("hostnameHash".into(), Value::String(h));
+        }
+        if let Some(h) = fingerprint_hash(&profile.os_user) {
+            components.insert("osUserHash".into(), Value::String(h));
+        }
+        if let Some(h) = fingerprint_hash(&profile.git_email) {
+            components.insert("gitEmailHash".into(), Value::String(h));
+        }
+        components.insert("platform".into(), Value::String("win32".into()));
+        components.insert("arch".into(), Value::String("x64".into()));
+        components.insert("osRelease".into(), Value::String("10.0.22631".into()));
+        components.insert("isContainer".into(), Value::Bool(false));
+        components.insert("cpuModel".into(), Value::String(profile.cpu_model.clone()));
+        components.insert("cpuCount".into(), Value::from(profile.cpu_count));
+        components.insert("memGiB".into(), Value::from(profile.memory_gb));
+        components.insert("timezone".into(), Value::String(profile.timezone.clone()));
+        components.insert("runtime".into(), Value::String("cli".into()));
+        components.insert("collectorVersion".into(), Value::from(1));
         let body = serde_json::json!({
             "thumbmark": thumbmark(&profile.machine_id, &profile.macs, &profile.hostname, &profile.cpu_model),
             "components": Value::Object(components),
@@ -811,36 +850,35 @@ fn fp_digest(salt: &str, api_key: &str, field: &str) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
-// 候选池：内存与 MAC 数逐字来自手册；CPU/时区/用户名/邮箱域手册只给数量与
-// 特征（源码行 69–108），具体值未逐字载明——先放特征相符的占位集，
-// 拿到原文后逐字替换（选择机制与确定性不受池内容影响）。
-const CPU_POOL: [&str; 15] = [
-    "12th Gen Intel(R) Core(TM) i5-12400 (12 cores)",
-    "12th Gen Intel(R) Core(TM) i7-12700 (20 cores)",
-    "12th Gen Intel(R) Core(TM) i9-12900K (24 cores)",
-    "13th Gen Intel(R) Core(TM) i5-13400 (16 cores)",
-    "13th Gen Intel(R) Core(TM) i7-13700 (24 cores)",
-    "13th Gen Intel(R) Core(TM) i9-13900K (32 cores)",
-    "Intel(R) Core(TM) Ultra 5 125H (18 cores)",
-    "Intel(R) Core(TM) Ultra 7 155H (22 cores)",
-    "Intel(R) Core(TM) Ultra 9 185H (24 cores)",
-    "AMD Ryzen 5 5600X (12 cores)",
-    "AMD Ryzen 5 7600X (12 cores)",
-    "AMD Ryzen 7 5800X (16 cores)",
-    "AMD Ryzen 7 7700X (16 cores)",
-    "AMD Ryzen 9 5900X (24 cores)",
-    "AMD Ryzen 9 7950X (32 cores)",
+// 候选池逐字对照 proxy.mjs:69-108。派生 field 名按参考是 cpu/mem
+// （label 形如 "{model}|{cores}"）——field 名错了同 key 会派生出不同设备。
+const CPU_POOL: [(&str, u32); 15] = [
+    ("12th Gen Intel(R) Core(TM) i7-12650H", 10),
+    ("12th Gen Intel(R) Core(TM) i5-12400F", 6),
+    ("12th Gen Intel(R) Core(TM) i9-12900K", 16),
+    ("13th Gen Intel(R) Core(TM) i7-13700K", 16),
+    ("13th Gen Intel(R) Core(TM) i5-13600K", 14),
+    ("13th Gen Intel(R) Core(TM) i9-13900K", 24),
+    ("Intel(R) Core(TM) Ultra 7 155H", 16),
+    ("Intel(R) Core(TM) Ultra 9 285H", 16),
+    ("Intel(R) Core(TM) i9-14900K", 24),
+    ("Intel(R) Core(TM) i7-14700K", 20),
+    ("AMD Ryzen 7 7800X3D", 8),
+    ("AMD Ryzen 9 7950X", 16),
+    ("AMD Ryzen 5 7600", 6),
+    ("AMD Ryzen 9 7900X", 12),
+    ("AMD Ryzen 7 5800X3D", 8),
 ];
 const MEMORY_POOL: [u32; 6] = [8, 16, 24, 32, 48, 64];
 const TIMEZONE_POOL: [&str; 15] = [
-    "Asia/Shanghai", "Asia/Tokyo", "Asia/Singapore", "Asia/Hong_Kong", "Asia/Seoul",
+    "America/New_York", "America/Chicago", "America/Los_Angeles", "America/Toronto",
     "Europe/London", "Europe/Berlin", "Europe/Paris", "Europe/Moscow",
-    "America/New_York", "America/Chicago", "America/Los_Angeles", "America/Sao_Paulo",
-    "Australia/Sydney", "UTC",
+    "Asia/Shanghai", "Asia/Tokyo", "Asia/Singapore", "Asia/Seoul", "Asia/Hong_Kong",
+    "Australia/Sydney", "Pacific/Auckland",
 ];
 const MAC_COUNT_POOL: [u32; 4] = [2, 3, 4, 5];
-const OSUSER_POOL: [&str; 6] = ["dev", "alex", "sam", "jordan", "taylor", "casey"];
-const MAIL_DOMAIN_POOL: [&str; 4] = ["gmail.com", "outlook.com", "yahoo.com", "proton.me"];
+const OSUSER_POOL: [&str; 6] = ["dev", "user", "admin", "coder", "engineer", "work"];
+const MAIL_DOMAIN_POOL: [&str; 4] = ["gmail.com", "outlook.com", "qq.com", "163.com"];
 
 /// 伪造的设备档案：全部由 apiKey 确定性派生（坑 28：换指纹本身是可疑信号）。
 #[derive(Debug, Clone, PartialEq)]
@@ -849,6 +887,7 @@ pub struct DeviceProfile {
     pub macs: Vec<String>,
     pub hostname: String,
     pub cpu_model: String,
+    pub cpu_count: u32,
     pub memory_gb: u32,
     pub timezone: String,
     pub os_user: String,
@@ -877,6 +916,13 @@ pub fn derive_device_profile(api_key: &str, salt: &str) -> DeviceProfile {
             .map(|(_, c)| c)
             .unwrap_or(pool[0])
     };
+    // CPU 池 label 是 "{model}|{cores}"（proxy.mjs:140），field 名 cpu
+    let cpu = CPU_POOL
+        .iter()
+        .map(|(m, c)| (fp_digest(salt, api_key, &format!("cpu {m}|{c}")).to_vec(), (*m, *c)))
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, mc)| mc)
+        .unwrap_or(CPU_POOL[0]);
     let machine_id = hex_uuid(&fp_digest(salt, api_key, "machineId")[..16]);
     let mac_count = pick_u32("macCount", &MAC_COUNT_POOL) as usize;
     let mut macs: Vec<String> = (0..mac_count)
@@ -907,8 +953,9 @@ pub fn derive_device_profile(api_key: &str, salt: &str) -> DeviceProfile {
         machine_id,
         macs,
         hostname,
-        cpu_model: pick("cpuModel", &CPU_POOL),
-        memory_gb: pick_u32("memoryGb", &MEMORY_POOL),
+        cpu_model: cpu.0.to_string(),
+        cpu_count: cpu.1,
+        memory_gb: pick_u32("mem", &MEMORY_POOL),
         timezone: pick("timezone", &TIMEZONE_POOL),
         git_email: format!("{os_user}.{email_hex}@{domain}"),
         os_user,

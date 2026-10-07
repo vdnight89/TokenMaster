@@ -204,13 +204,13 @@ async fn assistant_block_order_and_tool_result_name_lookup() {
     assert_eq!(types, vec!["reasoning", "text", "tool-call"], "次序错会被上游拒绝");
     assert_eq!(blocks[0]["text"], json!("先查天气"));
     assert_eq!(blocks[2]["toolCallId"], json!("call_1"));
-    assert_eq!(blocks[2]["toolName"], json!("shell_output"), "工具名过别名表 bash_output→shell_output");
+    assert_eq!(blocks[2]["toolName"], json!("bash_output"), "消息体 toolName 用原始名（别名只在 tools 声明做）");
     assert_eq!(blocks[2]["input"], json!({ "city": "北京" }), "arguments 解析为对象");
     // tool 消息 → tool-result，name 由 id 反查
     let tr = &msgs[2]["content"][0];
     assert_eq!(msgs[2]["role"], json!("tool"));
     assert_eq!(tr["type"], json!("tool-result"));
-    assert_eq!(tr["toolName"], json!("shell_output"), "toolName 从 assistant 反查（不硬塞空名）");
+    assert_eq!(tr["toolName"], json!("bash_output"), "toolName 从 assistant 反查（原始名）");
     assert_eq!(tr["output"], json!({ "type": "text", "value": "晴" }));
 }
 
@@ -324,6 +324,24 @@ async fn zero_output_maps_to_rate_limit() {
 }
 
 #[tokio::test]
+async fn finish_step_alone_completes_with_usage_fallback() {
+    let (base, cap) = spawn().await;
+    cap.lock().unwrap().ndjson = Some(
+        [
+            r#"{"type":"text-delta","text":"ok"}"#.to_string(),
+            r#"{"type":"finish-step","finishReason":"stop","usage":{"inputTokens":5,"outputTokens":2}}"#.to_string(),
+        ]
+        .join("
+"),
+    );
+    let out = pv(base).complete(&cred(), &route(), &plain_req()).await.unwrap();
+    // 只收到 finish-step 也算正常完成，usage 回退用它的 usage
+    assert!(out.choices[0].message.content.contains("ok"));
+    assert_eq!(out.usage.prompt_tokens, 5);
+    assert_eq!(out.usage.completion_tokens, 2);
+}
+
+#[tokio::test]
 async fn invalid_key_shape_rejected_before_send() {
     let (base, cap) = spawn().await;
     let err = pv(base)
@@ -343,7 +361,7 @@ async fn status_map_and_finish_reason_pure_functions() {
     assert_eq!(map_finish_reason("tool_use"), "tool_calls");
     assert_eq!(map_finish_reason("max_output_tokens"), "length");
     assert_eq!(map_finish_reason("model_context_window_exceeded"), "length");
-    assert_eq!(map_finish_reason("pause_turn"), "length", "OpenAI 侧折 length（坑9）");
+    assert_eq!(map_finish_reason("pause_turn"), "pause_turn", "原样保留不折（proxy.mjs:926）");
     assert_eq!(map_finish_reason("whatever-new"), "whatever-new", "未知值原样不折 stop");
     assert_eq!(slugify(r"C:\Users\dev\projects\app"), "c-users-dev-projects-app");
     assert_eq!(slugify("!!!"), "root", "空折叠兜底 root");

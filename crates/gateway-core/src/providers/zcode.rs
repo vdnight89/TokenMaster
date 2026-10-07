@@ -16,7 +16,7 @@
 //! （zcode-pool prompt.rs 的做法）；stub 测试不需要。
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::anthropic::{completion_from_anthropic, openai_to_anthropic_body};
 use crate::openai::{ChatCompletion, ChatRequest};
@@ -36,10 +36,31 @@ pub struct ZcodeLoginFlow {
 }
 
 /// 余额（单位：token）。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ZcodeBalance {
-    pub total_tokens: u64,
-    pub used_tokens: u64,
+    /// 企业版形态：不下发额度数字（buckets 空、remaining/total=0）。
+    pub enterprise: bool,
+    pub buckets: Vec<ZcodeBalanceBucket>,
+    /// Σ(available_units ?? remaining_units)；**单位是 token**（unit_type）。
+    pub remaining: u64,
+    pub total: u64,
+    /// 最早到期时间（Unix 秒），供展示解禁时刻。
+    pub expires_at: Option<u64>,
+}
+
+/// billing/balance 的一个额度桶（参考 upstream.ts:119-146 实测形状）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZcodeBalanceBucket {
+    pub plan_id: Option<String>,
+    pub show_name: Option<String>,
+    /// 实测 "token"——不是积分，展示按 M 量级。
+    pub unit_type: Option<String>,
+    pub meter: Option<String>,
+    pub total_units: Option<u64>,
+    pub used_units: Option<u64>,
+    pub remaining_units: Option<u64>,
+    pub available_units: Option<u64>,
+    pub expires_at: Option<u64>,
 }
 
 /// 可领套餐（entitlements 里 meter=model_usage 且 unit_type=token 的量）。
@@ -183,6 +204,10 @@ impl ZcodeProvider {
     }
 
     /// 余额（token 计）：需 Authorization + X-Device-Mid（identity_headers 已带）。
+    /// 余额：`data.balances[]` 桶累加（available 优先于 remaining）；
+    /// `displayMode=="enterprise"` 不下发额度数字。
+    /// ⚠️ 每日赠送**不在 balances 里**，只在 preview.plans——余额展示
+    /// 需另取 claim_preview 合并，否则面板显示 0（参考 upstream.ts:151-163）。
     pub async fn balance(&self, cred: &Credential) -> Result<ZcodeBalance, ProviderError> {
         let resp = self
             .client
@@ -198,10 +223,49 @@ impl ZcodeProvider {
         }
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| ProviderError::Upstream(format!("balance body: {e}")))?;
-        Ok(ZcodeBalance {
-            total_tokens: v["data"]["total"].as_u64().unwrap_or(0),
-            used_tokens: v["data"]["used"].as_u64().unwrap_or(0),
-        })
+        let data = v.get("data").cloned().unwrap_or(Value::Null);
+        if data.get("displayMode").and_then(Value::as_str) == Some("enterprise") {
+            return Ok(ZcodeBalance {
+                enterprise: true,
+                buckets: Vec::new(),
+                remaining: 0,
+                total: 0,
+                expires_at: None,
+            });
+        }
+        let str_of = |m: &Map<String, Value>, k: &str| m.get(k).and_then(Value::as_str).map(str::to_string);
+        let u64_of = |m: &Map<String, Value>, k: &str| m.get(k).and_then(Value::as_u64);
+        let mut buckets = Vec::new();
+        if let Some(arr) = data.get("balances").and_then(Value::as_array) {
+            for item in arr {
+                let Some(obj) = item.as_object() else { continue };
+                buckets.push(ZcodeBalanceBucket {
+                    plan_id: str_of(obj, "plan_id"),
+                    show_name: str_of(obj, "show_name"),
+                    unit_type: str_of(obj, "unit_type"),
+                    meter: str_of(obj, "meter"),
+                    total_units: u64_of(obj, "total_units"),
+                    used_units: u64_of(obj, "used_units"),
+                    remaining_units: u64_of(obj, "remaining_units"),
+                    available_units: u64_of(obj, "available_units"),
+                    expires_at: u64_of(obj, "expires_at"),
+                });
+            }
+        }
+        let mut remaining = 0u64;
+        let mut total = 0u64;
+        let mut expires_at: Option<u64> = None;
+        for b in &buckets {
+            remaining += b.available_units.or(b.remaining_units).unwrap_or(0);
+            total += b.total_units.unwrap_or(0);
+            if let Some(exp) = b.expires_at {
+                expires_at = Some(match expires_at {
+                    Some(prev) => prev.min(exp),
+                    None => exp,
+                });
+            }
+        }
+        Ok(ZcodeBalance { enterprise: false, buckets, remaining, total, expires_at })
     }
 
     /// 补激活事件（app_launch/app_daily_active/app_login_success）——

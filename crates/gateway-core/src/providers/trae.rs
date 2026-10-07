@@ -227,15 +227,22 @@ impl TraeProvider {
         if code != 0 {
             return Err(ProviderError::Upstream(format!("balance code {code}")));
         }
-        let items = v
-            .get("data")
+        // 形状对照参考 trae-credits.ts:330-389：
+        // data.user_entitlement_pack_list[].entitlement_base_info.quota.credits_limit
+        // 与同条目 usage.credits_amount、条目级 expire_time（秒）。
+        let packs = v
+            .pointer("/data/user_entitlement_pack_list")
             .and_then(Value::as_array)
-            .ok_or_else(|| ProviderError::Upstream("balance 响应缺 data 数组".into()))?;
-        let total: i64 = items
+            .cloned()
+            .unwrap_or_default();
+        let total: i64 = packs
             .iter()
-            .map(|it| {
-                let limit = it.get("credits_limit").and_then(Value::as_i64).unwrap_or(0);
-                let used = it.get("credits_amount").and_then(Value::as_i64).unwrap_or(0);
+            .map(|pack| {
+                let limit = pack
+                    .pointer("/entitlement_base_info/quota/credits_limit")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let used = pack.pointer("/usage/credits_amount").and_then(Value::as_i64).unwrap_or(0);
                 limit - used
             })
             .sum();
