@@ -23,6 +23,10 @@ pub enum ProviderError {
     /// 网络/上游故障，可换号或退避重试。
     #[error("upstream failure: {0}")]
     Upstream(String),
+    /// 上下文超限（gemini 句式 "The input token count (N) exceeds…" 无 context
+    /// 字样，须专属判据）。确定性失败：换号无用，客户端应触发自动压缩。
+    #[error("context window exceeded: {0}")]
+    ContextWindowExceeded(String),
 }
 
 /// 上游流式增量。网关把它翻译成 OpenAI chunk；

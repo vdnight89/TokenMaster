@@ -353,6 +353,7 @@ fn provider_error(e: ProviderError) -> ApiError {
         ProviderError::Credential(msg) => ApiError::Upstream { status: 401, code: "provider_credentials_rejected".into(), msg },
         ProviderError::BadRequest(msg) => ApiError::Message(msg),
         ProviderError::Upstream(msg) => ApiError::Upstream { status: 502, code: "upstream_error".into(), msg },
+        ProviderError::ContextWindowExceeded(msg) => ApiError::Upstream { status: 400, code: "context_window_exceeded".into(), msg },
     }
 }
 

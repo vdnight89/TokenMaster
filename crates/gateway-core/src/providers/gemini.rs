@@ -34,7 +34,8 @@ pub struct GeminiProvider {
     base: String,
     /// 探测到空时的兜底 project（`aicode-consumers`）。
     fallback_project: String,
-    session_id: String,
+    /// 会话派生 + 升代状态。
+    session: std::sync::Mutex<SessionState>,
     client: reqwest::Client,
     /// 探测成功后缓存的 project（None = 尚未探测）。
     resolved_project: std::sync::Mutex<Option<String>>,
@@ -116,16 +117,98 @@ impl SigStore {
     }
 }
 
+/// 会话升代状态：派生因子 `(project, 首条 user 文本, lane)` 的确定性散列，
+/// 外加代数计数。服务端按 sessionId 累计 token，1M 超限后该 id **永久 400**，
+/// 唯一出路是升代换新 id（一次请求最多一代）。
+#[derive(Default)]
+struct SessionState {
+    base: String,
+    gen: u32,
+}
+
+fn format_session(s: &SessionState) -> String {
+    if s.gen == 0 {
+        s.base.clone()
+    } else {
+        format!("{}-g{}", s.base, s.gen)
+    }
+}
+
+/// lane 语义参考实现未载明；按上游端点 host 近似（daily/sandbox 两条端点
+/// 即两条 lane，端口不参与——同一 host 的测试 stub 不换会话）。
+fn host_of(base: &str) -> String {
+    base.trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or(base)
+        .split(':')
+        .next()
+        .unwrap_or(base)
+        .to_string()
+}
+
+/// 上下文超限专属判据（§4.14 要点⑤：句式无 context 字样，
+/// harness 认不出，不能靠通用 400 处理）。
+pub fn is_context_exceeded(text: &str) -> bool {
+    text.contains("The input token count") && text.contains("exceeds")
+}
+
 impl GeminiProvider {
     pub fn new(base: String, fallback_project: String) -> Self {
         Self {
             base,
             fallback_project,
-            session_id: format!("sess-{}", crate::key::random_id(8)),
+            session: std::sync::Mutex::new(SessionState::default()),
             client: reqwest::Client::new(),
             resolved_project: std::sync::Mutex::new(None),
             sigs: std::sync::Arc::new(SigStore::in_memory()),
         }
+    }
+
+    /// sessionId 确定性派生：`(project, 首条 user 文本, lane)` 散列，
+    /// 跨实例稳定（非随机）——同一会话因子命中服务端同一累计桶。
+    pub fn derive_session_id(project: &str, first_user: &str, lane: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(project.as_bytes());
+        h.update([0u8]);
+        h.update(first_user.as_bytes());
+        h.update([0u8]);
+        h.update(lane.as_bytes());
+        let hex = format!("{:x}", h.finalize());
+        format!("sess-{}", &hex[..16])
+    }
+
+    fn first_user_text(req: &ChatRequest) -> String {
+        req.messages
+            .iter()
+            .find(|m| m.role == "user")
+            .map(|m| m.text())
+            .unwrap_or_default()
+    }
+
+    /// 会话解析：派生因子变化 → 切换新会话（gen 归零）；返回当前代 sessionId。
+    fn current_session_id(&self, project: &str, req: &ChatRequest) -> String {
+        let lane = host_of(&self.base);
+        let base = Self::derive_session_id(project, &Self::first_user_text(req), &lane);
+        let mut s = self.session.lock().unwrap();
+        if s.base != base {
+            *s = SessionState { base, gen: 0 };
+        }
+        format_session(&s)
+    }
+
+    /// 升代：gen+1 换新 id（服务端按 id 累计，削本地历史无用）。
+    fn bump_generation(&self, project: &str, req: &ChatRequest) -> String {
+        let lane = host_of(&self.base);
+        let base = Self::derive_session_id(project, &Self::first_user_text(req), &lane);
+        let mut s = self.session.lock().unwrap();
+        if s.base != base {
+            *s = SessionState { base, gen: 0 };
+        }
+        s.gen += 1;
+        format_session(&s)
     }
 
     pub fn production() -> Self {
@@ -176,7 +259,7 @@ impl GeminiProvider {
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
         let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
         if status != 200 {
             return Err(map_status_error(status, String::from_utf8_lossy(&bytes).to_string()));
         }
@@ -220,7 +303,7 @@ impl GeminiProvider {
             .await
             .map_err(|e| ProviderError::Upstream(e.to_string()))?;
         let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
         if status != 200 {
             return Err(map_status_error(status, String::from_utf8_lossy(&bytes).to_string()));
         }
@@ -247,7 +330,7 @@ impl GeminiProvider {
         map
     }
 
-    fn build_envelope(&self, project: &str, route: &Route, req: &ChatRequest) -> Result<Value, ProviderError> {
+    fn build_envelope(&self, project: &str, session_id: &str, route: &Route, req: &ChatRequest) -> Result<Value, ProviderError> {
         let name_map = Self::tool_name_map(req);
         let mut contents: Vec<Value> = Vec::new();
         let mut system_parts: Vec<String> = Vec::new();
@@ -317,7 +400,7 @@ impl GeminiProvider {
             generation.insert("temperature".into(), t.clone());
         }
         request.insert("generationConfig".into(), Value::Object(generation));
-        request.insert("sessionId".into(), Value::String(self.session_id.clone()));
+        request.insert("sessionId".into(), Value::String(session_id.to_string()));
         if !system_parts.is_empty() {
             request.insert(
                 "systemInstruction".into(),
@@ -354,40 +437,53 @@ impl GeminiProvider {
         Ok(alphabetize(&Value::Object(root)))
     }
 
+    /// 发送推理请求：返回 (HTTP 状态, 响应体)。
+    /// 400 处置升级式：先判上下文超限（升代重试一次，再超限归
+    /// `ContextWindowExceeded`），否则带签被拒去签重试一次。
     async fn send(
         &self,
         cred: &Credential,
         route: &Route,
         req: &ChatRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
+    ) -> Result<(u16, Vec<u8>), ProviderError> {
         // 探测失败不发推理（失败 ≠ 探测到空）
         let project = self.resolve_project(cred).await?;
-        let body = self.build_envelope(&project, route, req)?;
         let url = format!("{}{}", self.base, GENERATE_PATH);
         let headers = self.identity_headers(cred);
-        let mut resp = self
-            .client
-            .post(&url)
-            .headers(headers.clone())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
-        // 带签被 400 拒 → 去签重试一次（§4.14 要点②；仅一次，不再循环）
-        if resp.status().as_u16() == 400 {
+        let post = |body: Value| {
+            let mut req = self.client.post(&url);
+            req = req.headers(headers.clone()).json(&body);
+            async move { req.send().await }
+        };
+        let sid = self.current_session_id(&project, req);
+        let body = self.build_envelope(&project, &sid, route, req)?;
+        let resp = post(body.clone()).await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
+        if status == 400 {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            if is_context_exceeded(&text) {
+                // 升代自愈：服务端按 sessionId 累计，唯一出路换新 id；一次请求最多一代
+                let sid2 = self.bump_generation(&project, req);
+                let body2 = self.build_envelope(&project, &sid2, route, req)?;
+                let resp2 = post(body2).await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+                let status2 = resp2.status().as_u16();
+                let bytes2 = resp2.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
+                if status2 == 400 && is_context_exceeded(&String::from_utf8_lossy(&bytes2)) {
+                    return Err(ProviderError::ContextWindowExceeded(text));
+                }
+                return Ok((status2, bytes2));
+            }
+            // 带签被拒 → 去签重试一次（§4.14 要点②；仅一次，不再循环）
             let stripped = strip_thought_signatures(&body);
             if stripped != body {
-                resp = self
-                    .client
-                    .post(&url)
-                    .headers(headers)
-                    .json(&stripped)
-                    .send()
-                    .await
-                    .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+                let resp2 = post(stripped).await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+                let status2 = resp2.status().as_u16();
+                let bytes2 = resp2.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?.to_vec();
+                return Ok((status2, bytes2));
             }
         }
-        Ok(resp)
+        Ok((status, bytes))
     }
 }
 
@@ -520,9 +616,7 @@ impl Provider for GeminiProvider {
     }
 
     async fn complete(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChatCompletion, ProviderError> {
-        let resp = self.send(cred, route, req).await?;
-        let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let (status, bytes) = self.send(cred, route, req).await?;
         if status != 200 {
             return Err(map_status_error(status, String::from_utf8_lossy(&bytes).to_string()));
         }
@@ -553,9 +647,7 @@ impl Provider for GeminiProvider {
     }
 
     async fn stream(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<ChunkStream, ProviderError> {
-        let resp = self.send(cred, route, req).await?;
-        let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(|e| ProviderError::Upstream(e.to_string()))?;
+        let (status, bytes) = self.send(cred, route, req).await?;
         if status != 200 {
             return Err(map_status_error(status, String::from_utf8_lossy(&bytes).to_string()));
         }

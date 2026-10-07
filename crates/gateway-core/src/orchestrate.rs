@@ -64,6 +64,10 @@ pub async fn complete_with_retry(
             Err(ProviderError::BadRequest(_)) => {
                 return Err(ApiError::Message("request rejected by upstream".into()));
             }
+            // 上下文超限是请求本身的确定性失败：换号无用，直接终态（客户端触发压缩）
+            Err(ProviderError::ContextWindowExceeded(msg)) => {
+                return Err(ApiError::Upstream { status: 400, code: "context_window_exceeded".into(), msg });
+            }
             Err(e @ ProviderError::RateLimited { retry_after_secs, .. }) => {
                 let until = now + retry_after_secs.unwrap_or(DEFAULT_RATE_LIMIT_SECS);
                 pool.lock()
