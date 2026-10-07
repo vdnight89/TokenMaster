@@ -60,7 +60,7 @@ async fn spawn_balance_stub() -> (String, Arc<Mutex<Cap>>) {
 
 fn secret() -> String {
     json!({
-        "token": "jwt-tok",
+        "access_token": "jwt-tok",
         "refresh_token": "rt-1",
         "uid": "u-9527",
         "machine_id": "0123456789abcdef0123456789abcdef",
@@ -130,11 +130,11 @@ async fn old_flow_callback_builds_credential_with_persistent_ids() {
     assert_eq!(resp.status(), 200);
     let cred = flow.wait_credential().await.unwrap();
     let v: Value = serde_json::from_str(&cred.secret).unwrap();
-    assert_eq!(v["token"], json!("jwt-1"));
+    assert_eq!(v["access_token"], json!("jwt-1"));
     assert_eq!(v["refresh_token"], json!("rt-9"));
     assert_eq!(v["uid"], json!("u-1"), "uid 优先取 userInfo.uid");
     // 中文昵称双重编码乱码自动回转
-    assert_eq!(v["screen_name"], json!("开发者"), "昵称回转：{}", v["screen_name"]);
+    assert_eq!(v["nickname"], json!("开发者"), "昵称回转：{}", v["nickname"]);
     // machine_id/device_id 32hex 一次性生成
     assert_eq!(v["machine_id"].as_str().unwrap().len(), 32);
     assert_eq!(v["device_id"].as_str().unwrap().len(), 32);
