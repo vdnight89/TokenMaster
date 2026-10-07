@@ -110,12 +110,21 @@ pub fn map_status_error(status: u16, msg: String) -> ProviderError {
 }
 
 /// error 事件状态采纳链（§7 坑 12）：message 里的三位状态码 > error.statusCode > 502。
+/// 公开供单测（error 事件状态采纳链）。
+pub fn status_from_parts_pub(message: &str, status_code: Option<u16>) -> u16 {
+    status_from_parts(message, status_code)
+}
+
 fn status_from_parts(message: &str, status_code: Option<u16>) -> u16 {
-    for tok in message.split(|c: char| !c.is_ascii_digit()) {
-        if tok.len() == 3 {
-            if let Ok(n) = tok.parse::<u16>() {
-                if (100..=599).contains(&n) {
-                    return n;
+    // 只认 message **开头**的 `<NNN>`（对齐 CLI readStreamErrorEvent 与
+    // proxy.mjs:1027-1030；扫正文任意三位数会把普通数字误当状态码）
+    if let Some(rest) = message.trim_start().strip_prefix('<') {
+        if let Some(gt) = rest.find('>') {
+            if gt == 3 {
+                if let Ok(n) = rest[..gt].parse::<u16>() {
+                    if (100..=599).contains(&n) {
+                        return n;
+                    }
                 }
             }
         }
@@ -410,8 +419,13 @@ fn parse_ndjson(body: &str) -> NdjsonOut {
 pub struct CommandcodeProvider {
     base: String,
     client: reqwest::Client,
-    /// sessionId（UUID 形态）+ 过期时刻；12h + rand(0..1h)。
-    session: std::sync::Mutex<Option<(String, u64)>>,
+    /// 上游读超时（秒）。参考 idle 语义（流 30s/非流 90s）在缓冲架构下
+    /// 以总超时近似；超时 → 429 rate_limit + retry 5（不可重试）。
+    timeout_secs: u64,
+    /// 首字节前重试上限（共 retry_max+1 次尝试；退避 400ms×attempt）。
+    retry_max: u32,
+    /// per-key sessionId（UUID 形态）+ 过期时刻；12h + rand(0..1h)。
+    session: std::sync::Mutex<std::collections::HashMap<String, (String, u64)>>,
     /// per-key 上报节奏：account_id → next_init_at（成功后 8h+rand(0..2h)）。
     init_state: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
@@ -421,7 +435,9 @@ impl CommandcodeProvider {
         Self {
             base,
             client: reqwest::Client::new(),
-            session: std::sync::Mutex::new(None),
+            session: std::sync::Mutex::new(std::collections::HashMap::new()),
+            timeout_secs: 90,
+            retry_max: 2,
             init_state: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -430,17 +446,30 @@ impl CommandcodeProvider {
         Self::new(DEFAULT_BASE.into())
     }
 
-    fn ensure_session(&self) -> String {
+    /// 注入读超时与重试上限（测试）。
+    pub fn with_timeout(mut self, secs: u64, retry_max: u32) -> Self {
+        self.timeout_secs = secs;
+        self.retry_max = retry_max;
+        self
+    }
+
+    fn ensure_session(&self, cred: &Credential, req: &ChatRequest) -> String {
+        // 客户端 prompt_cache_key ≥8 字符优先采信（proxy.mjs:363-375）
+        if let Some(pk) = req.raw.get("prompt_cache_key").and_then(Value::as_str) {
+            if pk.len() >= 8 {
+                return pk.to_string();
+            }
+        }
         let now = now_ts_secs();
         let mut s = self.session.lock().unwrap();
-        if let Some((id, exp)) = s.as_ref() {
+        if let Some((id, exp)) = s.get(&cred.account_id) {
             if now < *exp {
                 return id.clone();
             }
         }
         let id = random_uuid();
         let ttl = 12 * 3600 + rand::Rng::random_range(&mut rand::rng(), 0..3600);
-        *s = Some((id.clone(), now + ttl));
+        s.insert(cred.account_id.clone(), (id.clone(), now + ttl));
         id
     }
 
@@ -456,27 +485,54 @@ impl CommandcodeProvider {
             .min(MAX_TOKENS_CAP);
         params.insert("max_tokens".into(), Value::from(mt));
         params.insert("stream".into(), Value::Bool(true));
-        // system 块数组；无 system 发空格占位（issue #17：阻止上游注入默认提示词）
-        let sys_texts: Vec<String> = req
-            .messages
-            .iter()
-            .filter(|m| m.role == "system" || m.role == "developer")
-            .map(|m| m.text())
-            .filter(|t| !t.is_empty())
-            .collect();
-        let system: Vec<Value> = if sys_texts.is_empty() {
-            vec![serde_json::json!({ "type": "text", "text": " " })]
-        } else {
-            let last = sys_texts.len() - 1;
-            sys_texts
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let text = if i < last { format!("{t}\n") } else { t.clone() };
-                    serde_json::json!({ "type": "text", "text": text })
-                })
-                .collect()
-        };
+        // system 块数组；无 system 发空格占位（issue #17）。块级 cache_control
+        // 透传；客户端全程未标断点但有 prompt_cache_key 且 system 非空时，
+        // 把 {type:'ephemeral'} 落在最后一块（缓存按前缀计算，system 是最前缀；
+        // proxy.mjs:634-641）。
+        let mut system: Vec<Value> = Vec::new();
+        let mut saw_cache_control = false;
+        for m in req.messages.iter().filter(|m| m.role == "system" || m.role == "developer") {
+            match &m.content {
+                Value::Array(blocks) => {
+                    for b in blocks {
+                        if b.get("cache_control").is_some() {
+                            saw_cache_control = true;
+                        }
+                        if let Some(t) = b.get("text").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                system.push(b.clone());
+                            }
+                        }
+                    }
+                }
+                Value::String(t) if !t.is_empty() => {
+                    system.push(serde_json::json!({ "type": "text", "text": t }));
+                }
+                _ => {}
+            }
+        }
+        if system.len() > 1 {
+            let last = system.len() - 1;
+            for blk in system.iter_mut().take(last) {
+                let t = blk.get("text").and_then(Value::as_str).map(str::to_string);
+                if let Some(t) = t {
+                    if let Some(obj) = blk.as_object_mut() {
+                        obj.insert("text".into(), Value::String(format!("{t}\n")));
+                    }
+                }
+            }
+        }
+        if system.is_empty() {
+            system = vec![serde_json::json!({ "type": "text", "text": " " })];
+        } else if !saw_cache_control {
+            if let Some(pk) = req.raw.get("prompt_cache_key").and_then(Value::as_str) {
+                if pk.len() >= 8 {
+                    if let Some(obj) = system.last_mut().and_then(Value::as_object_mut) {
+                        obj.insert("cache_control".into(), serde_json::json!({ "type": "ephemeral" }));
+                    }
+                }
+            }
+        }
         params.insert("system".into(), Value::Array(system));
         if let Some(t) = req.raw.get("temperature") {
             params.insert("temperature".into(), t.clone());
@@ -531,7 +587,7 @@ impl CommandcodeProvider {
             )));
         }
         self.ensure_initialized(cred).await;
-        let session_id = self.ensure_session();
+        let session_id = self.ensure_session(cred, req);
         let body = self.build_cc_request(&session_id, route, req);
         let traceparent = format!(
             "00-{}-{}-01",
@@ -553,10 +609,18 @@ impl CommandcodeProvider {
             .client
             .post(format!("{}{}", self.base, GENERATE_PATH))
             .headers(h)
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProviderError::Upstream(e.to_string()))?;
+            .map_err(|e| {
+                if e.is_timeout() {
+                    // 超时 → 429 rate_limit + retry 5（proxy.mjs idle 看门狗语义）
+                    ProviderError::RateLimited { retry_after_secs: Some(5), msg: "upstream read timeout".into() }
+                } else {
+                    ProviderError::Upstream(e.to_string())
+                }
+            })?;
         let status = resp.status().as_u16();
         let bytes = resp
             .bytes()
@@ -707,6 +771,27 @@ impl CommandcodeProvider {
 
     /// NDJSON 聚合 + 终态校验（零输出/无 finish），complete 与 stream 共用。
     async fn collect(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<NdjsonOut, ProviderError> {
+        // 首字节前重试（proxy.mjs:1405-1412/1548-1551）：缓冲架构下收到完整
+        // 响应前未向下游写出任何字节，天然满足"已写字节绝不重试"；
+        // 网络错与"无 finish 截断"可重试，超时（RateLimited）与业务错不重试。
+        let mut attempt: u32 = 0;
+        loop {
+            match self.try_collect(cred, route, req).await {
+                Ok(out) => return Ok(out),
+                Err(e) => {
+                    let retryable = matches!(e, ProviderError::Upstream(_)) && attempt < self.retry_max;
+                    if !retryable {
+                        return Err(e);
+                    }
+                    // 退避 400ms × 尝试序号（proxy.mjs:259-262）
+                    tokio::time::sleep(std::time::Duration::from_millis(400 * u64::from(attempt + 1))).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    async fn try_collect(&self, cred: &Credential, route: &Route, req: &ChatRequest) -> Result<NdjsonOut, ProviderError> {
         let (status, bytes) = self.send(cred, route, req).await?;
         if status != 200 {
             return Err(map_status_error(status, String::from_utf8_lossy(&bytes).to_string()));

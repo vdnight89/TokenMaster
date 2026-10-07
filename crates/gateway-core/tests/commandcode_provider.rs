@@ -33,6 +33,9 @@ struct Cap {
     headers: Option<HeaderMap>,
     /// NDJSON 响应行（可配置；默认 happy path）
     ndjson: Option<String>,
+    /// 按次响应（第 n 次请求取第 n 条；耗尽回退 ndjson/默认）
+    responses: Vec<String>,
+    hits: usize,
 }
 
 async fn stub_generate(State(cap): State<Arc<Mutex<Cap>>>, headers: HeaderMap, body: axum::extract::Request) -> Response {
@@ -44,7 +47,12 @@ async fn stub_generate(State(cap): State<Arc<Mutex<Cap>>>, headers: HeaderMap, b
     if !auth.contains("user_") {
         return (StatusCode::UNAUTHORIZED, "invalid key").into_response();
     }
-    let ndjson = c.ndjson.clone().unwrap_or_else(|| {
+    let nth = c.hits;
+    c.hits += 1;
+    let ndjson = (nth < c.responses.len())
+        .then(|| c.responses[nth].clone())
+        .or_else(|| c.ndjson.clone())
+        .unwrap_or_else(|| {
         [
             r#"{"type":"start"}"#,
             r#"{"type":"text-delta","text":"你"}"#,
@@ -296,7 +304,7 @@ async fn missing_finish_is_truncation_not_forged_completion() {
     cap.lock().unwrap().ndjson = Some(
         [
             r#"{"type":"text-delta","text":"半截"}"#.to_string(),
-            r#"{"type":"error","error":{"message":"boom 429 too many","code":"RATE_LIMITED"}}"#.to_string(),
+            r#"{"type":"error","error":{"message":"<429> boom rate limited","code":"RATE_LIMITED"}}"#.to_string(),
         ]
         .join("\n"),
     );
@@ -365,4 +373,26 @@ async fn status_map_and_finish_reason_pure_functions() {
     assert_eq!(map_finish_reason("whatever-new"), "whatever-new", "未知值原样不折 stop");
     assert_eq!(slugify(r"C:\Users\dev\projects\app"), "c-users-dev-projects-app");
     assert_eq!(slugify("!!!"), "root", "空折叠兜底 root");
+}
+
+#[tokio::test]
+async fn truncated_stream_retried_before_first_byte() {
+    let (base, cap) = spawn().await;
+    {
+        let mut c = cap.lock().unwrap();
+        // 第一发：200 但无 finish（截断）；第二发：正常（默认 happy path）
+        c.responses = vec![r#"{"type":"text-delta","text":"半"}"#.to_string()];
+    }
+    let out = pv(base).complete(&cred(), &route(), &plain_req()).await.unwrap();
+    assert!(out.choices[0].message.content.contains("好"), "重试后拿到完整回复");
+    assert_eq!(cap.lock().unwrap().hits, 2, "截断在未吐字前重试一次");
+}
+
+#[test]
+fn status_adoption_only_leading_angle_bracket_code() {
+    use gateway_core::providers::commandcode::status_from_parts_pub;
+    // 中间的 429 不再被误认（proxy.mjs:1027-1030）
+    assert_eq!(status_from_parts_pub("boom 429 too many", None), 502);
+    assert_eq!(status_from_parts_pub("<429> too many", None), 429);
+    assert_eq!(status_from_parts_pub("err", Some(403)), 403);
 }
